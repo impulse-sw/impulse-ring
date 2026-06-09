@@ -4,6 +4,8 @@
 //! control segment under `/dev/shm` and the data arenas it hands out to
 //! connectors. Linux-only (Tier 0: arm64/amd64).
 
+#![deny(warnings, clippy::todo, clippy::unimplemented)]
+
 mod broker;
 mod registry;
 

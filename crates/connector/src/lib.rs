@@ -12,6 +12,8 @@
 //! # let _ = chans;
 //! ```
 
+#![deny(warnings, clippy::todo, clippy::unimplemented)]
+
 mod channel;
 mod client;
 mod rpc;

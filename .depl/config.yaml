@@ -134,3 +134,5 @@ pipelines:
         used: run-impulsed-daemon@0.1.0
       - title: Run test
         used: run-connector-demo@0.1.0
+      - title: Run test second time
+        used: run-connector-demo@0.1.0

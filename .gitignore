@@ -1,5 +1,6 @@
 /artifacts
 /target
+.directory
 **/*.rs.bk
 Cargo.lock.orig
 

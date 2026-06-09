@@ -9,6 +9,8 @@
 //! Tier 0 is Linux-only (arm64/amd64); see `SPEC/` for the byte-for-byte wire
 //! contract that native connectors in other languages implement against.
 
+#![deny(warnings, clippy::todo, clippy::unimplemented)]
+
 pub mod avro;
 pub mod control;
 pub mod frame;
