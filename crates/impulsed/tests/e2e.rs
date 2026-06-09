@@ -2,7 +2,7 @@
 //! drive a full register -> publish/subscribe -> RPC flow through shared memory,
 //! including the negative access-control and schema-mismatch paths.
 
-use impulse_connector::Connection;
+use impulse_ring_connector::Connection;
 use serde::{Deserialize, Serialize};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -156,6 +156,23 @@ fn full_flow_pubsub_and_rpc() {
     );
     assert!(denied_call.is_err(), "call with wrong key must fail");
   } // connections dropped here -> reply segments unlinked, threads joined
+
+  // Regression: once the owner of "metrics"/"add" has left (unregistered above),
+  // a fresh app must be able to re-publish the same channel and re-expose the
+  // same function instead of getting "already exists".
+  std::thread::sleep(Duration::from_millis(200)); // let the broker process Unregister
+  {
+    let reborn = Connection::connect("svc-a-restarted").expect("reconnect");
+    reborn
+      .publish_channel("metrics", METRIC_SCHEMA, Some("chan-key"))
+      .expect("re-publish after the previous owner left");
+    reborn
+      .expose_function::<AddReq, AddResp, _>("add", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |req| AddResp {
+        sum: req.a + req.b,
+      })
+      .expect("re-expose after the previous owner left");
+  }
+  std::thread::sleep(Duration::from_millis(100));
 
   // Shut the broker down and confirm it cleaned up its segments.
   drop(_broker);

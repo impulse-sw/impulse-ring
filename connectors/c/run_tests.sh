@@ -7,7 +7,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
 echo "==> building broker + rust peer"
-( cd "$root" && cargo build -p impulsed --example peer -p impulse-connector )
+( cd "$root" && cargo build -p impulsed --example peer -p impulse-ring-connector )
 
 echo "==> building C connector"
 cmake -S "$here" -B "$here/build" -DCMAKE_BUILD_TYPE=Release >/dev/null

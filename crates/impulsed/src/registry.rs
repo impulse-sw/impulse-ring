@@ -23,8 +23,7 @@ pub struct ChannelMeta {
 pub struct FunctionMeta {
   pub id: i64,
   pub name: String,
-  /// Owning client; reserved for the heartbeat reaper to reclaim arenas.
-  #[allow(dead_code)]
+  /// Owning client; used to reclaim the function when the client departs.
   pub owner: i64,
   pub req_fp: Fingerprint,
   pub resp_fp: Fingerprint,
@@ -66,6 +65,43 @@ impl Registry {
 
   pub fn remove_client(&mut self, id: i64) {
     self.clients.remove(&id);
+  }
+
+  /// Remove every channel owned by `owner`, returning their arena names so the
+  /// caller can unlink the backing shared memory.
+  pub fn remove_client_channels(&mut self, owner: i64) -> Vec<String> {
+    let ids: Vec<i64> = self
+      .channels
+      .iter()
+      .filter(|(_, c)| c.owner == owner)
+      .map(|(id, _)| *id)
+      .collect();
+    let mut arenas = Vec::new();
+    for id in ids {
+      if let Some(c) = self.channels.remove(&id) {
+        self.chan_by_name.remove(&c.name);
+        arenas.push(c.arena);
+      }
+    }
+    arenas
+  }
+
+  /// Remove every function owned by `owner`, returning their request-arena names.
+  pub fn remove_client_functions(&mut self, owner: i64) -> Vec<String> {
+    let ids: Vec<i64> = self
+      .functions
+      .iter()
+      .filter(|(_, f)| f.owner == owner)
+      .map(|(id, _)| *id)
+      .collect();
+    let mut arenas = Vec::new();
+    for id in ids {
+      if let Some(f) = self.functions.remove(&id) {
+        self.fn_by_name.remove(&f.name);
+        arenas.push(f.req_arena);
+      }
+    }
+    arenas
   }
 
   pub fn alloc_channel_id(&mut self) -> i64 {

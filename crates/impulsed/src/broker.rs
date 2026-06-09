@@ -21,8 +21,10 @@ pub struct Broker {
   reg: Registry,
   reply_rings: HashMap<i64, Ring>,
   _reply_segs: HashMap<i64, Arc<Segment>>,
-  /// Arenas created by the broker; kept mapped and unlinked on shutdown.
-  arenas: Vec<Arc<Segment>>,
+  /// Arenas created by the broker, keyed by segment name; kept mapped while in
+  /// use and unlinked when their owning channel/function is reclaimed or the
+  /// bus shuts down.
+  arenas: HashMap<String, Arc<Segment>>,
   /// Names of client-owned reply segments, unlinked when the bus shuts down so
   /// a client that died ungracefully does not leak shared memory.
   reply_names: Vec<String>,
@@ -58,7 +60,7 @@ impl Broker {
       reg: Registry::new(),
       reply_rings: HashMap::new(),
       _reply_segs: HashMap::new(),
-      arenas: Vec::new(),
+      arenas: HashMap::new(),
       reply_names: Vec::new(),
     })
   }
@@ -139,18 +141,38 @@ impl Broker {
 
   fn on_unregister(&mut self, frame: &Frame) -> io::Result<()> {
     let m: proto::Unregister = proto::from_frame(Kind::Unregister, frame)?;
-    self.reg.remove_client(m.client_id);
-    self.reply_rings.remove(&m.client_id);
-    self._reply_segs.remove(&m.client_id);
+    self.release_client(m.client_id);
     Ok(())
+  }
+
+  /// Reclaim everything a departing client owned: its channels and functions
+  /// (so their names become free again) and the backing arenas, plus its reply
+  /// ring. This is what lets an app restart and re-publish the same channel.
+  fn release_client(&mut self, client_id: i64) {
+    for arena in self.reg.remove_client_channels(client_id) {
+      self.reclaim_arena(&arena);
+    }
+    for arena in self.reg.remove_client_functions(client_id) {
+      self.reclaim_arena(&arena);
+    }
+    self.reg.remove_client(client_id);
+    self.reply_rings.remove(&client_id);
+    self._reply_segs.remove(&client_id);
   }
 
   /// Create + format a data arena, keep it mapped, and return its name.
   fn make_arena(&mut self, name: String, cap: usize) -> io::Result<String> {
     let seg = Arc::new(Segment::create(&name, ring_bytes(cap))?);
     Ring::format(seg.clone(), 0, cap)?;
-    self.arenas.push(seg);
+    self.arenas.insert(name.clone(), seg);
     Ok(name)
+  }
+
+  /// Drop the broker's mapping for an arena, which unlinks it from /dev/shm.
+  fn reclaim_arena(&mut self, name: &str) {
+    // Dropping the last `Arc<Segment>` unlinks the segment. Subscribers in other
+    // processes keep their own mappings until they close (POSIX semantics).
+    self.arenas.remove(name);
   }
 
   fn on_publish(&mut self, frame: &Frame) -> io::Result<()> {

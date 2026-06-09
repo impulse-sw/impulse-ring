@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p impulsed              # terminal 1
-//! cargo run -p impulse-connector --example demo   # terminal 2
+//! cargo run -p impulse-ring-connector --example demo   # terminal 2
 //! ```
 
 use impulse_ring_connector::Connection;

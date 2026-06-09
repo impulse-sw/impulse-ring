@@ -1,4 +1,4 @@
-//! `impulse-connector` — the native Rust connector for **Ring**.
+//! `impulse-ring-connector` — the native Rust connector for **Ring**.
 //!
 //! A connector registers an application on the bus, publishes and subscribes to
 //! channels (key-gated), exposes functions, and calls remote functions with an
@@ -6,7 +6,7 @@
 //! Avro and every cross-service boundary is fingerprint-checked.
 //!
 //! ```no_run
-//! use impulse_connector::Connection;
+//! use impulse_ring_connector::Connection;
 //! let conn = Connection::connect("my-service").unwrap();
 //! let chans = conn.list_channels().unwrap();
 //! # let _ = chans;

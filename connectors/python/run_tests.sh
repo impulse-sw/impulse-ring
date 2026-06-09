@@ -7,7 +7,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
 echo "==> building broker + rust peer"
-( cd "$root" && cargo build -p impulsed --example peer -p impulse-connector )
+( cd "$root" && cargo build -p impulsed --example peer -p impulse-ring-connector )
 
 echo "==> building native extension (_ring_native)"
 ( cd "$here" && python3 setup.py build_ext --inplace >/dev/null )
