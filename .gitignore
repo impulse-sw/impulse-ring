@@ -12,3 +12,7 @@ connectors/python/build/
 connectors/python/**/__pycache__/
 connectors/python/**/*.so
 connectors/python/*.egg-info/
+
+# C++ connector build
+connectors/cpp/build/
+/tmp/ir-ts-build/

@@ -22,49 +22,57 @@ with a full end-to-end path validated by an integration test:
 
 - ✅ `impulsed` broker: owns the control segment + data arenas, registers apps,
   routes the control plane, garbage-collects shared memory on crash/shutdown.
-- ✅ `impulse-core`: shared-memory segments, ring buffers (futex wakeup, adaptive
+- ✅ `impulse-ring-core`: shared-memory segments, ring buffers (futex wakeup, adaptive
   spin), Avro framing + fingerprinting, control protocol records.
-- ✅ `impulse-connector` (Rust): register, publish/subscribe (key-gated,
+- ✅ `impulse-ring-connector` (Rust): register, publish/subscribe (key-gated,
   fingerprint-checked), expose functions, async RPC `call`.
-- ✅ Byte-for-byte wire spec in [`SPEC/`](SPEC/) — the contract for native
+- ✅ Byte-for-byte wire spec in [`spec/`](spec/) — the contract for native
   connectors in other languages.
 
 ### Milestone 2 — native connectors (in progress)
 
-Other-language connectors are implemented **natively** against `spec/` (no
-binding to the Rust core). Per project policy, schema fingerprints are computed
-by the broker, so connectors send schema JSON and use the returned fingerprints.
+Connectors are implemented **natively** against `spec/` (no binding to the Rust
+core), except where a language can't touch shared memory directly. Per project
+policy, schema fingerprints are computed by the broker, so connectors send
+schema JSON and use the returned fingerprints.
 
-- ✅ **C** connector — [`connectors/c/`](connectors/c/): pure C11 + POSIX, with a
-  self-test and a C↔Rust cross-language data-plane test.
-- ✅ **Python** connector — [`connectors/python/`](connectors/python/): pure
-  Python protocol + a tiny C atomics/futex extension, with a self-test and a
-  Python↔Rust cross-language test.
-- ✅ **Go** connector — [`connectors/go/`](connectors/go/): pure Go, **no cgo**
-  (`sync/atomic` + raw `futex`), with a self-test and a Go↔Rust cross-language
-  test.
-- ⏳ C++, JS/TS — later.
+- ✅ **C** — [`connectors/c/`](connectors/c/): pure C11 + POSIX. Self-test +
+  C↔Rust cross-language test.
+- ✅ **C++** — [`connectors/cpp/`](connectors/cpp/): header-only RAII/STL wrapper
+  over the C core (not a reimplementation). Self-test.
+- ✅ **Python** — [`connectors/python/`](connectors/python/): pure Python protocol
+  + a tiny C atomics/futex extension. Self-test + Python↔Rust test.
+- ✅ **Go** — [`connectors/go/`](connectors/go/): pure Go, **no cgo**
+  (`sync/atomic` + raw `futex`). Self-test + Go↔Rust test.
+- ✅ **JS/TS** — [`connectors/ts/`](connectors/ts/): TypeScript over **Bun FFI** to
+  the C library (JS can't mmap/atomics in pure JS). Client surface
+  (publish/subscribe/call); TS↔Rust test.
+
+New to writing schemas? See **[spec/authoring-schemas.md](spec/authoring-schemas.md)**
+for how to describe messages and functions in Avro.
 
 CI (`.depl/config.yaml`) formats and lints every language — Rust (`cargo fmt`
-2-space/120 + `clippy`), C (`clang-format` 2-space/120 + `clang-tidy`), Python
-(`ruff` via `uv`), Go (`gofmt` + `go vet`) — and runs each connector's example
-against a live broker.
+2-space/120 + `clippy`), C/C++ (`clang-format` 2-space/120 + `clang-tidy`),
+Python (`ruff` via `uv`), Go (`gofmt` + `go vet`) — and runs each connector's
+example against a live broker.
 
 ## Workspace layout
 
 ```
 crates/
-  impulse-core/        shared mechanics (shm, ring, futex, frame, avro, proto, control)
+  core/               shared mechanics (shm, ring, futex, frame, avro, proto, control)
   impulsed/            the broker daemon (+ E2E test in tests/)
-  impulse-connector/   the Rust connector (+ runnable demo in examples/)
-SPEC/
+  connector/           the Rust connector (+ runnable demo in examples/)
+spec/
   wire-format.md       normative byte layout (segments, rings, frames, Avro)
   bootstrap.md         socket-free discovery & handshake
   schemas/             control.avsc, FINGERPRINTS.md, example user schemas
 connectors/
   c/                   native C connector (lib + header + tests)
+  cpp/                 header-only C++ wrapper over the C core
   python/              native Python connector (+ tiny atomics/futex extension)
   go/                  native Go connector (pure Go, no cgo)
+  ts/                  TypeScript connector (Bun FFI over the C library)
 ```
 
 ## Quickstart
@@ -74,13 +82,13 @@ connectors/
 cargo run -p impulsed
 
 # Terminal 2 — run the demo connector (publish/subscribe + RPC)
-cargo run -p impulse-connector --example demo
+cargo run -p impulse-ring-connector --example demo
 ```
 
 Using the connector from Rust:
 
 ```rust
-use impulse_connector::Connection;
+use impulse_ring_connector::Connection;
 use std::time::Duration;
 
 let conn = Connection::connect("my-service")?;
@@ -109,8 +117,8 @@ cargo fmt --check
 Regenerate the control schemas / fingerprints after a protocol change:
 
 ```sh
-cargo run -p impulse-core --example dump_schemas      > SPEC/schemas/control.avsc
-cargo run -p impulse-core --example dump_schemas fps  > SPEC/schemas/FINGERPRINTS.md
+cargo run -p impulse-ring-core --example dump_schemas      > spec/schemas/control.avsc
+cargo run -p impulse-ring-core --example dump_schemas fps  > spec/schemas/FINGERPRINTS.md
 ```
 
 ## Design notes & known limits (M1)
@@ -120,7 +128,7 @@ cargo run -p impulse-core --example dump_schemas fps  > SPEC/schemas/FINGERPRINT
 - One subscriber per channel; channel fan-out is a later milestone.
 - Heartbeat reaping is lenient; access keys use salted SHA-256 (argon2 later).
 
-See [`SPEC/wire-format.md`](SPEC/wire-format.md) for the full contract.
+See [`spec/wire-format.md`](spec/wire-format.md) for the full contract.
 
 ## License
 

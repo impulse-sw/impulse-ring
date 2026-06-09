@@ -1,0 +1,12 @@
+{
+  "name": "@impulse-ring/connector",
+  "version": "0.1.0",
+  "description": "Native TypeScript connector for Ring (Impulse) via Bun FFI",
+  "type": "module",
+  "private": true,
+  "module": "src/index.ts",
+  "scripts": {
+    "demo": "bun run examples/demo.ts",
+    "test": "bun test"
+  }
+}

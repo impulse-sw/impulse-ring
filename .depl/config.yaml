@@ -101,7 +101,7 @@ actions:
     action:
       type: staged
       stage: build
-      cmd: clang-format --dry-run --Werror connectors/c/src/*.c connectors/c/include/*.h connectors/c/examples/*.c connectors/c/tests/*.c
+      cmd: clang-format --dry-run --Werror connectors/c/src/*.c connectors/c/include/*.h connectors/c/examples/*.c connectors/c/tests/*.c connectors/cpp/include/*.hpp connectors/cpp/examples/*.cpp connectors/cpp/tests/*.cpp
       show_success_output: true
   - info: clang-tidy@0.1.0
     requirements:
@@ -203,6 +203,43 @@ actions:
       show_success_output: true
       show_cmd: false
       only_when_fresh: false
+  - info: build-cpp-connector@0.1.0
+    requirements:
+      - type: in_path
+        executable: cmake
+        desc: "Install cmake and a C++17 compiler."
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cmake -S connectors/cpp -B connectors/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/cpp/build'
+  - info: run-cpp-demo@0.1.0
+    action:
+      type: observe
+      cmd: ./connectors/cpp/build/irpp_demo
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: ts-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: bun
+        desc: "Install Bun: curl -fsSL https://bun.sh/install | bash"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cd connectors/ts && bun build src/index.ts examples/demo.ts --target=bun --outdir=/tmp/ir-ts-build >/dev/null'
+      show_success_output: true
+  - info: run-ts-demo@0.1.0
+    action:
+      type: observe
+      cmd: bash -c 'cd connectors/ts && bun run examples/demo.ts'
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
 pipelines:
   - title: common-ops
     info: impulse-ring-common-ops@0.1.0
@@ -251,7 +288,7 @@ pipelines:
   - title: lint-connectors
     info: impulse-ring-lint-connectors@0.1.0
     actions:
-      - title: Check C format (clang-format)
+      - title: Check C/C++ format (clang-format)
         used: clang-format-check@0.1.0
       - title: Lint C (clang-tidy)
         used: clang-tidy@0.1.0
@@ -263,18 +300,26 @@ pipelines:
         used: go-fmt-check@0.1.0
       - title: Vet Go (go vet)
         used: go-vet@0.1.0
+      - title: Check TS (bun build)
+        used: ts-check@0.1.0
   - title: connector-examples
     info: impulse-ring-connector-examples@0.1.0
     actions:
       - title: Build C connector
         used: build-c-connector@0.1.0
+      - title: Build C++ connector
+        used: build-cpp-connector@0.1.0
       - title: Build Python extension
         used: build-python-ext@0.1.0
       - title: Run `impulsed`
         used: run-impulsed-daemon@0.1.0
       - title: Run C example
         used: run-c-demo@0.1.0
+      - title: Run C++ example
+        used: run-cpp-demo@0.1.0
       - title: Run Python example
         used: run-python-demo@0.1.0
       - title: Run Go example
         used: run-go-demo@0.1.0
+      - title: Run TS example
+        used: run-ts-demo@0.1.0
