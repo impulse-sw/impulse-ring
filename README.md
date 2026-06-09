@@ -37,7 +37,9 @@ by the broker, so connectors send schema JSON and use the returned fingerprints.
 
 - ✅ **C** connector — [`connectors/c/`](connectors/c/): pure C11 + POSIX, with a
   self-test and a C↔Rust cross-language data-plane test.
-- ⏳ **Python** connector — next.
+- ✅ **Python** connector — [`connectors/python/`](connectors/python/): pure
+  Python protocol + a tiny C atomics/futex extension, with a self-test and a
+  Python↔Rust cross-language test.
 - ⏳ Go, C++, JS/TS — later.
 
 ## Workspace layout
@@ -53,6 +55,7 @@ SPEC/
   schemas/             control.avsc, FINGERPRINTS.md, example user schemas
 connectors/
   c/                   native C connector (lib + header + tests)
+  python/              native Python connector (+ tiny atomics/futex extension)
 ```
 
 ## Quickstart

@@ -4,3 +4,9 @@ Cargo.lock.orig
 
 # C connector build
 connectors/c/build/
+
+# Python connector build artifacts
+connectors/python/build/
+connectors/python/**/__pycache__/
+connectors/python/**/*.so
+connectors/python/*.egg-info/

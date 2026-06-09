@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "impulse-ring"
+version = "0.1.0"
+description = "Native Python connector for Ring (Impulse) — shared-memory IPC with Avro"
+requires-python = ">=3.8"
+license = { text = "MIT" }
