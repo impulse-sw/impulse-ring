@@ -47,13 +47,21 @@ fut = conn.call_async("add", e.getvalue())   # fut.result() -> bytes
 conn.close()
 ```
 
-## Tests
+## CI & tests
 
-`run_tests.sh` builds the broker, the Rust `peer`, and the extension, then runs:
+CI (see `.depl/config.yaml`) lints with `ruff` (`uvx ruff check` + `ruff format
+--check`, line-length 120) and runs the Python example against a live broker in
+the `connector-examples` pipeline. Locally:
 
 ```sh
-./run_tests.sh
+# build broker + Rust peer, then the native extension
+cargo build -p impulsed --example peer -p impulse-ring-connector
+cd connectors/python && python3 setup.py build_ext --inplace
+
+python3 tests/test_e2e.py   # self-contained: spawns the broker + peer itself
 ```
+
+The end-to-end test runs:
 
 1. **Python self-test**: two Python clients do register → publish/subscribe
    (key-gated) → RPC, plus negative ACL cases.

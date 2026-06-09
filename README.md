@@ -31,7 +31,7 @@ with a full end-to-end path validated by an integration test:
 
 ### Milestone 2 — native connectors (in progress)
 
-Other-language connectors are implemented **natively** against `SPEC/` (no
+Other-language connectors are implemented **natively** against `spec/` (no
 binding to the Rust core). Per project policy, schema fingerprints are computed
 by the broker, so connectors send schema JSON and use the returned fingerprints.
 
@@ -40,7 +40,15 @@ by the broker, so connectors send schema JSON and use the returned fingerprints.
 - ✅ **Python** connector — [`connectors/python/`](connectors/python/): pure
   Python protocol + a tiny C atomics/futex extension, with a self-test and a
   Python↔Rust cross-language test.
-- ⏳ Go, C++, JS/TS — later.
+- ✅ **Go** connector — [`connectors/go/`](connectors/go/): pure Go, **no cgo**
+  (`sync/atomic` + raw `futex`), with a self-test and a Go↔Rust cross-language
+  test.
+- ⏳ C++, JS/TS — later.
+
+CI (`.depl/config.yaml`) formats and lints every language — Rust (`cargo fmt`
+2-space/120 + `clippy`), C (`clang-format` 2-space/120 + `clang-tidy`), Python
+(`ruff` via `uv`), Go (`gofmt` + `go vet`) — and runs each connector's example
+against a live broker.
 
 ## Workspace layout
 
@@ -56,6 +64,7 @@ SPEC/
 connectors/
   c/                   native C connector (lib + header + tests)
   python/              native Python connector (+ tiny atomics/futex extension)
+  go/                  native Go connector (pure Go, no cgo)
 ```
 
 ## Quickstart

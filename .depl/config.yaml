@@ -91,6 +91,118 @@ actions:
       cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
       daemon: true
       daemon_wait_seconds: 2
+  # ---- connector linting & formatting (2-space / 120 cols where the tool allows) ----
+  - info: clang-format-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: clang-format
+        desc: "Install clang-format (LLVM): apt install clang-format"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: clang-format --dry-run --Werror connectors/c/src/*.c connectors/c/include/*.h connectors/c/examples/*.c connectors/c/tests/*.c
+      show_success_output: true
+  - info: clang-tidy@0.1.0
+    requirements:
+      - type: in_path
+        executable: clang-tidy
+        desc: "Install clang-tidy (LLVM): apt install clang-tidy"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: clang-tidy connectors/c/src/impulse_ring.c -- -Iconnectors/c/include -D_GNU_SOURCE
+      show_success_output: true
+  - info: ruff-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: uv
+        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: uvx ruff check connectors/python
+      show_success_output: true
+  - info: ruff-format-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: uv
+        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: uvx ruff format --check connectors/python
+      show_success_output: true
+  - info: go-fmt-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: gofmt
+        desc: "Install Go: https://go.dev/dl"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'test -z "$(gofmt -l connectors/go)"'
+      show_success_output: true
+  - info: go-vet@0.1.0
+    requirements:
+      - type: in_path
+        executable: go
+        desc: "Install Go: https://go.dev/dl"
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cd connectors/go && go vet ./...'
+      show_success_output: true
+  # ---- connector example builds & runs (replaces the per-connector shell scripts) ----
+  - info: build-c-connector@0.1.0
+    requirements:
+      - type: in_path
+        executable: cmake
+        desc: "Install cmake."
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cmake -S connectors/c -B connectors/c/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/c/build'
+  - info: build-python-ext@0.1.0
+    requirements:
+      - type: in_path
+        executable: python3
+        desc: "Install Python 3 with development headers."
+    exec_in_project_dir: true
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cd connectors/python && python3 setup.py build_ext --inplace'
+  - info: run-c-demo@0.1.0
+    action:
+      type: observe
+      cmd: ./connectors/c/build/ir_demo
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-python-demo@0.1.0
+    action:
+      type: observe
+      cmd: python3 connectors/python/examples/demo.py
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-go-demo@0.1.0
+    action:
+      type: observe
+      cmd: bash -c 'cd connectors/go && go run ./examples/demo'
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
 pipelines:
   - title: common-ops
     info: impulse-ring-common-ops@0.1.0
@@ -136,3 +248,33 @@ pipelines:
         used: run-connector-demo@0.1.0
       - title: Run test second time
         used: run-connector-demo@0.1.0
+  - title: lint-connectors
+    info: impulse-ring-lint-connectors@0.1.0
+    actions:
+      - title: Check C format (clang-format)
+        used: clang-format-check@0.1.0
+      - title: Lint C (clang-tidy)
+        used: clang-tidy@0.1.0
+      - title: Lint Python (ruff)
+        used: ruff-check@0.1.0
+      - title: Check Python format (ruff)
+        used: ruff-format-check@0.1.0
+      - title: Check Go format (gofmt)
+        used: go-fmt-check@0.1.0
+      - title: Vet Go (go vet)
+        used: go-vet@0.1.0
+  - title: connector-examples
+    info: impulse-ring-connector-examples@0.1.0
+    actions:
+      - title: Build C connector
+        used: build-c-connector@0.1.0
+      - title: Build Python extension
+        used: build-python-ext@0.1.0
+      - title: Run `impulsed`
+        used: run-impulsed-daemon@0.1.0
+      - title: Run C example
+        used: run-c-demo@0.1.0
+      - title: Run Python example
+        used: run-python-demo@0.1.0
+      - title: Run Go example
+        used: run-go-demo@0.1.0

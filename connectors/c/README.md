@@ -1,7 +1,7 @@
 # Ring — C connector
 
 A **native** C connector for Ring. It implements the wire protocol from
-[`SPEC/`](../../SPEC/) directly (shared memory, ring buffers, futex wakeup,
+[`spec/`](../../spec/) directly (shared memory, ring buffers, futex wakeup,
 frames, Avro datums, control messages) — it does **not** bind to the Rust core.
 Pure C11 + POSIX; Linux only (Tier 0: arm64/amd64).
 
@@ -40,13 +40,21 @@ ir_disconnect(c);
 See [`examples/demo.c`](examples/demo.c) for a full publish/subscribe + RPC flow,
 and the public API in [`include/impulse_ring.h`](include/impulse_ring.h).
 
-## Tests
+## CI & tests
 
-`run_tests.sh` builds the broker, the C library, and runs two suites against a
-live `impulsed`:
+CI (see `.depl/config.yaml`) lints the C sources (`clang-format` at 2-space/120
+plus `clang-tidy`) and runs the C example against a live broker in the
+`connector-examples` pipeline. To run things locally:
 
 ```sh
-./run_tests.sh
+# build broker + Rust peer (for the cross-language test) and the C library
+cargo build -p impulsed --example peer -p impulse-ring-connector
+cmake -S connectors/c -B connectors/c/build && cmake --build connectors/c/build
+
+./target/debug/impulsed &                 # start the broker
+./connectors/c/build/ir_test_e2e          # C self-test (register/pub-sub/RPC + ACL)
+./target/debug/examples/peer &            # Rust peer for the cross-language test
+./connectors/c/build/ir_xlang             # C subscribes to / calls Rust
 ```
 
 1. **C self-test** (`tests/test_e2e.c`): two C clients do register →

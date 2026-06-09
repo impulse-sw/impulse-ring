@@ -11,7 +11,8 @@ schema JSON and use the fingerprints the broker returns.
 import secrets
 import threading
 from collections import namedtuple
-from concurrent.futures import Future, TimeoutError as FTimeout
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FTimeout
 
 from . import avro, frame, proto, shm
 from .ring import Ring, ring_bytes
@@ -153,7 +154,7 @@ class Connection:
         except FTimeout:
             with self._lock:
                 self._pending.pop(corr, None)
-            raise RingError("timed out waiting for broker reply")
+            raise RingError("timed out waiting for broker reply") from None
 
     # ---- channels ----
     def publish_channel(self, name, schema_json, key=None) -> Publisher:
@@ -248,9 +249,7 @@ class Connection:
             raise RingError(f"expose failed: {msg}", status)
         mm = shm.open_segment(arena)
         req_ring = Ring.attach(mm, 0)
-        t = threading.Thread(
-            target=self._serve, args=(req_ring, req_fp, resp_fp, handler), daemon=True
-        )
+        t = threading.Thread(target=self._serve, args=(req_ring, req_fp, resp_fp, handler), daemon=True)
         t.start()
         self._services.append(t)
 
@@ -362,4 +361,4 @@ class Connection:
         try:
             return fut.result(timeout)
         except FTimeout:
-            raise RingError("rpc call timed out")
+            raise RingError("rpc call timed out") from None

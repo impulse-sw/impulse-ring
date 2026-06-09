@@ -26,10 +26,7 @@ ADD_REQ = (
     '{"type":"record","name":"AddReq","namespace":"ring.examples",'
     '"fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}'
 )
-ADD_RESP = (
-    '{"type":"record","name":"AddResp","namespace":"ring.examples",'
-    '"fields":[{"name":"sum","type":"long"}]}'
-)
+ADD_RESP = '{"type":"record","name":"AddResp","namespace":"ring.examples","fields":[{"name":"sum","type":"long"}]}'
 
 failures = 0
 
@@ -161,7 +158,7 @@ def main():
         broker.terminate()
         broker.wait()
 
-    print("\n%s (%d failures)" % ("FAILED" if failures else "PASSED", failures))
+    print(f"\n{'FAILED' if failures else 'PASSED'} ({failures} failures)")
     return 1 if failures else 0
 
 
