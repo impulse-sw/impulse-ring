@@ -4,8 +4,10 @@
  * frames, Avro datums, control messages) is implemented natively here against
  * spec/; nothing binds to the Rust core. Cross-process atomicity uses C11/GCC
  * __atomic builtins; blocking uses the Linux futex syscall directly.
+ *
+ * _GNU_SOURCE is defined by the build (CMake / the -D flag) rather than here, to
+ * avoid defining a reserved identifier in the translation unit.
  */
-#define _GNU_SOURCE
 #include "impulse_ring.h"
 
 #include <errno.h>
@@ -509,8 +511,11 @@ static int ring_push(ring *r, const uint8_t *data, size_t len, int timeout_ms) {
   }
 }
 
-/* Pop one record into a heap buffer. Returns length, or 0 if empty. */
-static size_t ring_try_pop(ring *r, uint8_t **out) {
+/* Pop one record into a heap buffer. Returns 1 if a record was popped (caller
+ * frees *out; *out_len is its length, which may be 0), or 0 if the ring is
+ * empty. Returning a found-flag separate from the length avoids leaking the
+ * buffer on a zero-length record. */
+static int ring_try_pop(ring *r, uint8_t **out, size_t *out_len) {
   uint64_t tail = __atomic_load_n(r_u64(r, R_TAIL), __ATOMIC_RELAXED);
   uint64_t head = __atomic_load_n(r_u64(r, R_HEAD), __ATOMIC_ACQUIRE);
   if (head == tail)
@@ -526,22 +531,22 @@ static size_t ring_try_pop(ring *r, uint8_t **out) {
   __atomic_fetch_add(r_u32(r, R_SPACE_SEQ), 1, __ATOMIC_RELEASE);
   futex_wake(r_u32(r, R_SPACE_SEQ), INT_MAX);
   *out = p;
-  return len;
+  *out_len = len;
+  return 1;
 }
 
-static size_t ring_pop_blocking(ring *r, int timeout_ms, uint8_t **out) {
+/* Returns 1 if a record was popped (sets *out and *out_len), or 0 on timeout. */
+static int ring_pop_blocking(ring *r, int timeout_ms, uint8_t **out, size_t *out_len) {
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
   for (;;) {
     for (int i = 0; i < 256; i++) {
-      size_t n = ring_try_pop(r, out);
-      if (n)
-        return n;
+      if (ring_try_pop(r, out, out_len))
+        return 1;
     }
     uint32_t seen = __atomic_load_n(r_u32(r, R_DATA_SEQ), __ATOMIC_ACQUIRE);
-    size_t n = ring_try_pop(r, out);
-    if (n)
-      return n;
+    if (ring_try_pop(r, out, out_len))
+      return 1;
     if (timeout_ms >= 0) {
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
@@ -770,8 +775,8 @@ static void *dispatcher_main(void *arg) {
   ir_conn *c = (ir_conn *)arg;
   while (c->running) {
     uint8_t *rec = NULL;
-    size_t n = ring_pop_blocking(&c->reply_ring, 100, &rec);
-    if (!n)
+    size_t n = 0;
+    if (!ring_pop_blocking(&c->reply_ring, 100, &rec, &n))
       continue;
     uint64_t fp;
     const uint8_t *body;
@@ -1142,8 +1147,8 @@ ir_subscriber *ir_subscribe(ir_conn *c, int64_t channel_id, const char *key) {
 
 int ir_recv(ir_subscriber *s, int timeout_ms, uint8_t **body, size_t *len) {
   uint8_t *rec = NULL;
-  size_t n = ring_pop_blocking(&s->ring, timeout_ms, &rec);
-  if (!n)
+  size_t n = 0;
+  if (!ring_pop_blocking(&s->ring, timeout_ms, &rec, &n))
     return 0;
   uint64_t fp;
   const uint8_t *b;
@@ -1197,8 +1202,8 @@ static void *service_main(void *arg) {
   service *sv = (service *)arg;
   while (*sv->running) {
     uint8_t *rec = NULL;
-    size_t n = ring_pop_blocking(&sv->req_ring, 100, &rec);
-    if (!n)
+    size_t n = 0;
+    if (!ring_pop_blocking(&sv->req_ring, 100, &rec, &n))
       continue;
     uint64_t fp;
     const uint8_t *body;

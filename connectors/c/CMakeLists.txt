@@ -4,6 +4,9 @@ project(impulse_ring_c C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -O2)
+# Needed for syscall()/futex; defined here (not in the source) to avoid defining
+# a reserved identifier in the translation unit.
+add_compile_definitions(_GNU_SOURCE)
 
 find_package(Threads REQUIRED)
 
