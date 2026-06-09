@@ -1,0 +1,8 @@
+{
+  "type": "record",
+  "name": "AddResp",
+  "namespace": "ring.examples",
+  "fields": [
+    { "name": "sum", "type": "long" }
+  ]
+}

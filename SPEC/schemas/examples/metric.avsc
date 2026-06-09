@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "Metric",
+  "namespace": "ring.examples",
+  "fields": [
+    { "name": "name", "type": "string" },
+    { "name": "value", "type": "double" }
+  ]
+}
