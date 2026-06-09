@@ -23,6 +23,19 @@ pub struct Broker {
     _reply_segs: HashMap<i64, Arc<Segment>>,
     /// Arenas created by the broker; kept mapped and unlinked on shutdown.
     arenas: Vec<Arc<Segment>>,
+    /// Names of client-owned reply segments, unlinked when the bus shuts down so
+    /// a client that died ungracefully does not leak shared memory.
+    reply_names: Vec<String>,
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        // The bus is going down; reclaim client reply segments (the broker only
+        // opened them, so they are not unlinked by their `Segment` drop).
+        for name in &self.reply_names {
+            let _ = shm::unlink(name);
+        }
+    }
 }
 
 impl Broker {
@@ -46,6 +59,7 @@ impl Broker {
             reply_rings: HashMap::new(),
             _reply_segs: HashMap::new(),
             arenas: Vec::new(),
+            reply_names: Vec::new(),
         })
     }
 
@@ -114,6 +128,7 @@ impl Broker {
         let client_id = self.reg.add_client(m.app_name.clone());
         self.reply_rings.insert(client_id, ring);
         self._reply_segs.insert(client_id, seg);
+        self.reply_names.push(m.reply_segment.clone());
         log::info!("registered '{}' as client {client_id}", m.app_name);
         self.reply(
             client_id,

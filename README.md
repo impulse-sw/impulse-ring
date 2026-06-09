@@ -29,8 +29,16 @@ with a full end-to-end path validated by an integration test:
 - ✅ Byte-for-byte wire spec in [`SPEC/`](SPEC/) — the contract for native
   connectors in other languages.
 
-Other-language connectors (Go, C/C++, Python, JS/TS) are implemented **natively**
-against `SPEC/` in later milestones.
+### Milestone 2 — native connectors (in progress)
+
+Other-language connectors are implemented **natively** against `SPEC/` (no
+binding to the Rust core). Per project policy, schema fingerprints are computed
+by the broker, so connectors send schema JSON and use the returned fingerprints.
+
+- ✅ **C** connector — [`connectors/c/`](connectors/c/): pure C11 + POSIX, with a
+  self-test and a C↔Rust cross-language data-plane test.
+- ⏳ **Python** connector — next.
+- ⏳ Go, C++, JS/TS — later.
 
 ## Workspace layout
 
@@ -43,6 +51,8 @@ SPEC/
   wire-format.md       normative byte layout (segments, rings, frames, Avro)
   bootstrap.md         socket-free discovery & handshake
   schemas/             control.avsc, FINGERPRINTS.md, example user schemas
+connectors/
+  c/                   native C connector (lib + header + tests)
 ```
 
 ## Quickstart
