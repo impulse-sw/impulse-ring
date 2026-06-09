@@ -21,40 +21,40 @@ const FUTEX_WAKE: libc::c_int = 1;
 /// check performed kernel-side). A spurious wakeup is possible; callers must
 /// re-check their condition in a loop.
 pub fn wait(word: &AtomicU32, expected: u32, timeout: Option<Duration>) {
-    let uaddr = word as *const AtomicU32 as *const libc::c_void;
-    let ts = timeout.map(|d| libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos() as libc::c_long,
-    });
-    let ts_ptr = ts
-        .as_ref()
-        .map(|t| t as *const libc::timespec)
-        .unwrap_or(std::ptr::null());
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            uaddr,
-            FUTEX_WAIT,
-            expected as libc::c_int,
-            ts_ptr,
-            std::ptr::null::<libc::c_void>(),
-            0,
-        );
-    }
+  let uaddr = word as *const AtomicU32 as *const libc::c_void;
+  let ts = timeout.map(|d| libc::timespec {
+    tv_sec: d.as_secs() as libc::time_t,
+    tv_nsec: d.subsec_nanos() as libc::c_long,
+  });
+  let ts_ptr = ts
+    .as_ref()
+    .map(|t| t as *const libc::timespec)
+    .unwrap_or(std::ptr::null());
+  unsafe {
+    libc::syscall(
+      libc::SYS_futex,
+      uaddr,
+      FUTEX_WAIT,
+      expected as libc::c_int,
+      ts_ptr,
+      std::ptr::null::<libc::c_void>(),
+      0,
+    );
+  }
 }
 
 /// Wake up to `n` waiters parked on `word`. Use `i32::MAX` to wake all.
 pub fn wake(word: &AtomicU32, n: i32) {
-    let uaddr = word as *const AtomicU32 as *const libc::c_void;
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            uaddr,
-            FUTEX_WAKE,
-            n,
-            std::ptr::null::<libc::c_void>(),
-            std::ptr::null::<libc::c_void>(),
-            0,
-        );
-    }
+  let uaddr = word as *const AtomicU32 as *const libc::c_void;
+  unsafe {
+    libc::syscall(
+      libc::SYS_futex,
+      uaddr,
+      FUTEX_WAKE,
+      n,
+      std::ptr::null::<libc::c_void>(),
+      std::ptr::null::<libc::c_void>(),
+      0,
+    );
+  }
 }

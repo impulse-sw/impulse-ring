@@ -1,0 +1,136 @@
+project_name: impulse-ring
+version: 9
+ignore_files:
+  - .git
+  - target
+cache_files:
+  - target
+variables:
+  empty:
+    value:
+      type: plain
+      value: ""
+  package-connector:
+    value:
+      type: plain
+      value: impulse-ring-connector
+  package-core:
+    value:
+      type: plain
+      value: impulse-ring-core
+  package-impulsed:
+    value:
+      type: plain
+      value: impulsed
+  target-amd64:
+    value:
+      type: plain
+      value: x86_64-unknown-linux-gnu
+actions:
+  - info: cargo-fmt@0.1.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
+    exec_in_project_dir: true
+    skip_sync: false
+    action:
+      type: staged
+      stage: build
+      cmd: cargo fmt -- --config tab_spaces=2,max_width=120 $(find . -name "*.rs" -not -path "*/target/*")
+  - info: cargo-lint@0.2.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
+    action:
+      type: staged
+      stage: build
+      cmd: "{flags}cargo clippy --package {package} --target {target}{features}"
+      placeholders:
+        - "{flags}"
+        - "{package}"
+        - "{target}"
+        - "{features}"
+      show_success_output: true
+  - info: cargo-release@0.2.0
+    tags:
+      - rust
+      - cargo
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
+    action:
+      type: staged
+      stage: build
+      cmd: "{flags}cargo build --release --package {package} --target {target}"
+      placeholders:
+        - "{flags}"
+        - "{package}"
+        - "{target}"
+  - info: run-connector-demo@0.1.0
+    action:
+      type: observe
+      cmd: cargo run -p impulse-ring-connector --example demo
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-impulsed@0.1.0
+    action:
+      type: observe
+      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-impulsed-daemon@0.1.0
+    action:
+      type: custom
+      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
+      daemon: true
+      daemon_wait_seconds: 2
+pipelines:
+  - title: common-ops
+    info: impulse-ring-common-ops@0.1.0
+    actions:
+      - title: Format
+        used: cargo-fmt@0.1.0
+      - title: Lint `impulse-ring-core`
+        used: cargo-lint@0.2.0
+        with:
+          "{features}": empty
+          "{flags}": empty
+          "{package}": package-core
+          "{target}": target-amd64
+      - title: Lint `impulse-ring-connector`
+        used: cargo-lint@0.2.0
+        with:
+          "{features}": empty
+          "{flags}": empty
+          "{package}": package-connector
+          "{target}": target-amd64
+      - title: Lint `impulsed`
+        used: cargo-lint@0.2.0
+        with:
+          "{features}": empty
+          "{flags}": empty
+          "{package}": package-impulsed
+          "{target}": target-amd64
+      - title: Build `impulsed`
+        used: cargo-release@0.2.0
+        with:
+          "{flags}": empty
+          "{package}": package-impulsed
+          "{target}": target-amd64
+    artifacts:
+      - from: target/x86_64-unknown-linux-gnu/release/impulsed
+        to: impulsed
+  - title: demo
+    info: impulse-ring-demo@0.1.0
+    actions:
+      - title: Run `impulsed`
+        used: run-impulsed-daemon@0.1.0
+      - title: Run test
+        used: run-connector-demo@0.1.0

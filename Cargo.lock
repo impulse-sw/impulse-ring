@@ -198,19 +198,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "impulse-connector"
+name = "impulse-ring-connector"
 version = "0.1.0"
 dependencies = [
  "apache-avro",
  "getrandom",
- "impulse-core",
+ "impulse-ring-core",
  "libc",
  "log",
  "serde",
 ]
 
 [[package]]
-name = "impulse-core"
+name = "impulse-ring-core"
 version = "0.1.0"
 dependencies = [
  "apache-avro",
@@ -228,8 +228,8 @@ version = "0.1.0"
 dependencies = [
  "apache-avro",
  "getrandom",
- "impulse-connector",
- "impulse-core",
+ "impulse-ring-connector",
+ "impulse-ring-core",
  "libc",
  "log",
  "serde",

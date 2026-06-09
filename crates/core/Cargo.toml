@@ -1,14 +1,14 @@
 [package]
-name = "impulse-connector"
+name = "impulse-ring-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [dependencies]
-impulse-core = { path = "../impulse-core" }
 libc.workspace = true
 apache-avro.workspace = true
-serde = { workspace = true }
+serde.workspace = true
 getrandom.workspace = true
+serde_bytes.workspace = true
+sha2.workspace = true
 log.workspace = true

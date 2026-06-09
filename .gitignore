@@ -1,3 +1,4 @@
+/artifacts
 /target
 **/*.rs.bk
 Cargo.lock.orig

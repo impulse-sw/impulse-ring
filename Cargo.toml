@@ -1,18 +1,20 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
-    "crates/impulse-core",
+    "crates/core",
+    "crates/connector",
     "crates/impulsed",
-    "crates/impulse-connector",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-repository = "https://github.com/goidago/impulse-ring"
 
 [workspace.dependencies]
+impulse-ring-core = { path = "crates/core" }
+impulse-ring-connector = { path = "crates/connector" }
+
 libc = "0.2"
 apache-avro = "0.17"
 serde = { version = "1", features = ["derive"] }

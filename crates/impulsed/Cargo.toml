@@ -3,21 +3,20 @@ name = "impulsed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [[bin]]
 name = "impulsed"
 path = "src/main.rs"
 
 [dependencies]
-impulse-core = { path = "../impulse-core" }
+impulse-ring-core.workspace = true
 libc.workspace = true
 apache-avro.workspace = true
-serde = { workspace = true }
+serde.workspace = true
 getrandom.workspace = true
 log = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-impulse-connector = { path = "../impulse-connector" }
-impulse-core = { path = "../impulse-core" }
-serde = { workspace = true }
+impulse-ring-connector.workspace = true
+impulse-ring-core.workspace = true
+serde.workspace = true
