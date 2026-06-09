@@ -2,10 +2,17 @@ project_name: impulse-ring
 version: 9
 ignore_files:
   - .git
+  - build
   - target
 cache_files:
+  - build
   - target
 variables:
+  benchmark-laps:
+    value:
+      type: from_env_var
+      var_name: BENCH_LAPS
+    fallback: "1000000"
   empty:
     value:
       type: plain
@@ -27,12 +34,38 @@ variables:
       type: plain
       value: x86_64-unknown-linux-gnu
 actions:
+  - info: build-c-connector@0.1.0
+    requirements:
+      - type: in_path
+        executable: cmake
+        desc: Install cmake.
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cmake -S connectors/c -B connectors/c/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/c/build'
+  - info: build-cpp-connector@0.1.0
+    requirements:
+      - type: in_path
+        executable: cmake
+        desc: Install cmake and a C++17 compiler.
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cmake -S connectors/cpp -B connectors/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/cpp/build'
+  - info: build-python-ext@0.1.0
+    requirements:
+      - type: in_path
+        executable: python3
+        desc: Install Python 3 with development headers.
+    action:
+      type: staged
+      stage: build
+      cmd: bash -c 'cd connectors/python && python3 setup.py build_ext --inplace'
   - info: cargo-fmt@0.1.0
     requirements:
       - type: in_path
         executable: cargo
         desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
-    # cargo-fmt rewrites source in place, so it must run in the project dir.
     exec_in_project_dir: true
     skip_sync: false
     action:
@@ -70,29 +103,6 @@ actions:
         - "{flags}"
         - "{package}"
         - "{target}"
-  - info: run-connector-demo@0.1.0
-    action:
-      type: observe
-      cmd: cargo run -p impulse-ring-connector --example demo
-      ignore_fails: true
-      show_success_output: true
-      show_cmd: false
-      only_when_fresh: false
-  - info: run-impulsed@0.1.0
-    action:
-      type: observe
-      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
-      ignore_fails: true
-      show_success_output: true
-      show_cmd: false
-      only_when_fresh: false
-  - info: run-impulsed-daemon@0.1.0
-    action:
-      type: custom
-      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
-      daemon: true
-      daemon_wait_seconds: 2
-  # ---- connector linting & formatting (2-space / 120 cols where the tool allows) ----
   - info: clang-format-check@0.1.0
     requirements:
       - type: in_path
@@ -112,26 +122,6 @@ actions:
       type: staged
       stage: build
       cmd: clang-tidy connectors/c/src/impulse_ring.c -- -Iconnectors/c/include -D_GNU_SOURCE
-      show_success_output: true
-  - info: ruff-check@0.1.0
-    requirements:
-      - type: in_path
-        executable: uv
-        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    action:
-      type: staged
-      stage: build
-      cmd: uvx ruff check connectors/python
-      show_success_output: true
-  - info: ruff-format-check@0.1.0
-    requirements:
-      - type: in_path
-        executable: uv
-        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    action:
-      type: staged
-      stage: build
-      cmd: uvx ruff format --check connectors/python
       show_success_output: true
   - info: go-fmt-check@0.1.0
     requirements:
@@ -153,25 +143,69 @@ actions:
       stage: build
       cmd: bash -c 'cd connectors/go && go vet ./...'
       show_success_output: true
-  # ---- connector example builds & runs (replaces the per-connector shell scripts) ----
-  - info: build-c-connector@0.1.0
+  - info: ruff-check@0.1.0
     requirements:
+      - type: in_path
+        executable: uv
+        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    action:
+      type: staged
+      stage: build
+      cmd: uvx ruff check connectors/python
+      show_success_output: true
+  - info: ruff-format-check@0.1.0
+    requirements:
+      - type: in_path
+        executable: uv
+        desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    action:
+      type: staged
+      stage: build
+      cmd: uvx ruff format --check connectors/python
+      show_success_output: true
+  - info: run-benchmark-compiled@0.1.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: Install cargo (rustup).
       - type: in_path
         executable: cmake
-        desc: "Install cmake."
+        desc: Install cmake and a C/C++ compiler.
+      - type: in_path
+        executable: go
+        desc: "Install Go: https://go.dev/dl"
     action:
-      type: staged
-      stage: build
-      cmd: bash -c 'cmake -S connectors/c -B connectors/c/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/c/build'
-  - info: build-python-ext@0.1.0
+      type: observe
+      cmd: bash -c 'BENCH_LAPS={laps} ./benchmark/run-compiled.sh'
+      placeholders:
+        - "{laps}"
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-benchmark-all@0.1.0
     requirements:
       - type: in_path
-        executable: python3
-        desc: "Install Python 3 with development headers."
+        executable: cargo
+        desc: Install cargo (rustup).
+      - type: in_path
+        executable: cmake
+        desc: Install cmake and a C/C++ compiler.
+      - type: in_path
+        executable: go
+        desc: "Install Go: https://go.dev/dl"
+      - type: in_path
+        executable: bun
+        desc: "Install Bun: https://bun.sh"
     action:
-      type: staged
-      stage: build
-      cmd: bash -c 'cd connectors/python && python3 setup.py build_ext --inplace'
+      type: observe
+      cmd: bash -c 'BENCH_LAPS={laps} ./benchmark/run.sh'
+      placeholders:
+        - "{laps}"
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
   - info: run-c-demo@0.1.0
     action:
       type: observe
@@ -180,10 +214,18 @@ actions:
       show_success_output: true
       show_cmd: false
       only_when_fresh: false
-  - info: run-python-demo@0.1.0
+  - info: run-connector-demo@0.1.0
     action:
       type: observe
-      cmd: python3 connectors/python/examples/demo.py
+      cmd: cargo run -p impulse-ring-connector --example demo
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-cpp-demo@0.1.0
+    action:
+      type: observe
+      cmd: ./connectors/cpp/build/irpp_demo
       ignore_fails: true
       show_success_output: true
       show_cmd: false
@@ -196,19 +238,32 @@ actions:
       show_success_output: true
       show_cmd: false
       only_when_fresh: false
-  - info: build-cpp-connector@0.1.0
-    requirements:
-      - type: in_path
-        executable: cmake
-        desc: "Install cmake and a C++17 compiler."
-    action:
-      type: staged
-      stage: build
-      cmd: bash -c 'cmake -S connectors/cpp -B connectors/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build connectors/cpp/build'
-  - info: run-cpp-demo@0.1.0
+  - info: run-impulsed@0.1.0
     action:
       type: observe
-      cmd: ./connectors/cpp/build/irpp_demo
+      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-impulsed-daemon@0.1.0
+    action:
+      type: custom
+      cmd: ./target/x86_64-unknown-linux-gnu/release/impulsed
+      daemon: true
+      daemon_wait_seconds: 2
+  - info: run-python-demo@0.1.0
+    action:
+      type: observe
+      cmd: python3 connectors/python/examples/demo.py
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-ts-demo@0.1.0
+    action:
+      type: observe
+      cmd: bash -c 'cd connectors/ts && bun run examples/demo.ts'
       ignore_fails: true
       show_success_output: true
       show_cmd: false
@@ -223,36 +278,6 @@ actions:
       stage: build
       cmd: bash -c 'cd connectors/ts && bun build src/index.ts examples/demo.ts --target=bun --outdir=/tmp/ir-ts-build >/dev/null'
       show_success_output: true
-  - info: run-ts-demo@0.1.0
-    action:
-      type: observe
-      cmd: bash -c 'cd connectors/ts && bun run examples/demo.ts'
-      ignore_fails: true
-      show_success_output: true
-      show_cmd: false
-      only_when_fresh: false
-  - info: run-benchmark@0.1.0
-    requirements:
-      - type: in_path
-        executable: cargo
-        desc: "Install cargo (rustup)."
-      - type: in_path
-        executable: cmake
-        desc: "Install cmake and a C/C++ compiler."
-      - type: in_path
-        executable: go
-        desc: "Install Go: https://go.dev/dl"
-      - type: in_path
-        executable: bun
-        desc: "Install Bun: https://bun.sh"
-    action:
-      type: observe
-      # Reduced lap count keeps CI fast; the default (benchmark/run.sh) is 1,000,000.
-      cmd: bash -c 'BENCH_LAPS=2000 ./benchmark/run.sh'
-      ignore_fails: true
-      show_success_output: true
-      show_cmd: false
-      only_when_fresh: false
 pipelines:
   - title: common-ops
     info: impulse-ring-common-ops@0.1.0
@@ -340,4 +365,10 @@ pipelines:
     info: impulse-ring-benchmark@0.1.0
     actions:
       - title: Cross-language ring relay benchmark
-        used: run-benchmark@0.1.0
+        used: run-benchmark-all@0.1.0
+        with:
+          "{laps}": benchmark-laps
+      - title: Cross-language ring relay benchmark (only Rust, C, C++ & Go)
+        used: run-benchmark-compiled@0.1.0
+        with:
+          "{laps}": benchmark-laps
