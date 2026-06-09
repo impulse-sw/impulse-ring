@@ -1,0 +1,13 @@
+[package]
+name = "ring-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ring-bench"
+path = "src/main.rs"
+
+[dependencies]
+impulse-ring-connector.workspace = true
+serde = { workspace = true }

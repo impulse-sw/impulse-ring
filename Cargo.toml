@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/connector",
     "crates/impulsed",
+    "benchmark/rust",
 ]
 
 [workspace.package]

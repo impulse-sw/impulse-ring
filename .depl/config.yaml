@@ -32,6 +32,7 @@ actions:
       - type: in_path
         executable: cargo
         desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
+    # cargo-fmt rewrites source in place, so it must run in the project dir.
     exec_in_project_dir: true
     skip_sync: false
     action:
@@ -97,7 +98,6 @@ actions:
       - type: in_path
         executable: clang-format
         desc: "Install clang-format (LLVM): apt install clang-format"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -108,7 +108,6 @@ actions:
       - type: in_path
         executable: clang-tidy
         desc: "Install clang-tidy (LLVM): apt install clang-tidy"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -119,7 +118,6 @@ actions:
       - type: in_path
         executable: uv
         desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -130,7 +128,6 @@ actions:
       - type: in_path
         executable: uv
         desc: "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -141,7 +138,6 @@ actions:
       - type: in_path
         executable: gofmt
         desc: "Install Go: https://go.dev/dl"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -152,7 +148,6 @@ actions:
       - type: in_path
         executable: go
         desc: "Install Go: https://go.dev/dl"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -164,7 +159,6 @@ actions:
       - type: in_path
         executable: cmake
         desc: "Install cmake."
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -174,7 +168,6 @@ actions:
       - type: in_path
         executable: python3
         desc: "Install Python 3 with development headers."
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -208,7 +201,6 @@ actions:
       - type: in_path
         executable: cmake
         desc: "Install cmake and a C++17 compiler."
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -226,7 +218,6 @@ actions:
       - type: in_path
         executable: bun
         desc: "Install Bun: curl -fsSL https://bun.sh/install | bash"
-    exec_in_project_dir: true
     action:
       type: staged
       stage: build
@@ -236,6 +227,28 @@ actions:
     action:
       type: observe
       cmd: bash -c 'cd connectors/ts && bun run examples/demo.ts'
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-benchmark@0.1.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: "Install cargo (rustup)."
+      - type: in_path
+        executable: cmake
+        desc: "Install cmake and a C/C++ compiler."
+      - type: in_path
+        executable: go
+        desc: "Install Go: https://go.dev/dl"
+      - type: in_path
+        executable: bun
+        desc: "Install Bun: https://bun.sh"
+    action:
+      type: observe
+      # Reduced lap count keeps CI fast; the default (benchmark/run.sh) is 1,000,000.
+      cmd: bash -c 'BENCH_LAPS=2000 ./benchmark/run.sh'
       ignore_fails: true
       show_success_output: true
       show_cmd: false
@@ -323,3 +336,8 @@ pipelines:
         used: run-go-demo@0.1.0
       - title: Run TS example
         used: run-ts-demo@0.1.0
+  - title: benchmark
+    info: impulse-ring-benchmark@0.1.0
+    actions:
+      - title: Cross-language ring relay benchmark
+        used: run-benchmark@0.1.0
