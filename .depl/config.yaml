@@ -103,6 +103,17 @@ actions:
         - "{flags}"
         - "{package}"
         - "{target}"
+  - info: cargo-test@0.2.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: "Install `cargo` via your package manager or with this command: `curl https://sh.rustup.rs -sSf | sh`."
+    action:
+      type: test
+      cmd: cargo test --workspace
+      show_success_output: true
+      show_cmd: false
+      success_when_found: "test result: ok."
   - info: clang-format-check@0.1.0
     requirements:
       - type: in_path
@@ -163,26 +174,6 @@ actions:
       stage: build
       cmd: uvx ruff format --check connectors/python
       show_success_output: true
-  - info: run-benchmark-compiled@0.1.0
-    requirements:
-      - type: in_path
-        executable: cargo
-        desc: Install cargo (rustup).
-      - type: in_path
-        executable: cmake
-        desc: Install cmake and a C/C++ compiler.
-      - type: in_path
-        executable: go
-        desc: "Install Go: https://go.dev/dl"
-    action:
-      type: observe
-      cmd: bash -c 'BENCH_LAPS={laps} ./benchmark/run-compiled.sh'
-      placeholders:
-        - "{laps}"
-      ignore_fails: true
-      show_success_output: true
-      show_cmd: false
-      only_when_fresh: false
   - info: run-benchmark-all@0.1.0
     requirements:
       - type: in_path
@@ -200,6 +191,26 @@ actions:
     action:
       type: observe
       cmd: bash -c 'BENCH_LAPS={laps} ./benchmark/run.sh'
+      placeholders:
+        - "{laps}"
+      ignore_fails: true
+      show_success_output: true
+      show_cmd: false
+      only_when_fresh: false
+  - info: run-benchmark-compiled@0.1.0
+    requirements:
+      - type: in_path
+        executable: cargo
+        desc: Install cargo (rustup).
+      - type: in_path
+        executable: cmake
+        desc: Install cmake and a C/C++ compiler.
+      - type: in_path
+        executable: go
+        desc: "Install Go: https://go.dev/dl"
+    action:
+      type: observe
+      cmd: bash -c 'BENCH_LAPS={laps} ./benchmark/run-compiled.sh'
       placeholders:
         - "{laps}"
       ignore_fails: true
@@ -305,6 +316,8 @@ pipelines:
           "{flags}": empty
           "{package}": package-impulsed
           "{target}": target-amd64
+      - title: Test Impulse Ring (Rust)
+        used: cargo-test@0.2.0
       - title: Build `impulsed`
         used: cargo-release@0.2.0
         with:
