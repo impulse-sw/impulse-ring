@@ -28,10 +28,6 @@ pub struct Broker {
   /// Names of client-owned reply segments, unlinked when the bus shuts down so
   /// a client that died ungracefully does not leak shared memory.
   reply_names: Vec<String>,
-  /// Held `flock` on the singleton lock file. Kept open for the broker's whole
-  /// lifetime; closing it (on `Drop` or process exit) releases the lock so the
-  /// next broker may take over. Never read — only its existence matters.
-  _singleton_lock: std::fs::File,
 }
 
 /// Why [`Broker::start`] could not bring the broker up.
@@ -75,17 +71,17 @@ impl Drop for Broker {
 }
 
 impl Broker {
-  /// Bring up the broker: acquire the singleton lock, garbage-collect stale
-  /// segments from a prior run, then create and format the control segment.
+  /// Bring up the broker: refuse if a live broker already owns the bus, then
+  /// garbage-collect stale segments and create and format the control segment.
   ///
-  /// Returns [`StartError::AlreadyRunning`] if another `impulsed` already holds
-  /// the lock — in that case nothing is touched (in particular the live
-  /// broker's control segment is left intact).
+  /// Returns [`StartError::AlreadyRunning`] if another `impulsed` is already
+  /// running — in that case nothing is touched (the live broker's control
+  /// segment is left intact).
   pub fn start() -> Result<Broker, StartError> {
     // The singleton guard MUST come before `cleanup_stale`: that step unlinks
     // every Ring segment, which would tear the shared memory out from under a
     // broker that is already serving clients.
-    let singleton_lock = Self::acquire_singleton_lock()?;
+    Self::guard_singleton()?;
 
     Self::cleanup_stale();
     let bytes = control::control_segment_bytes();
@@ -105,44 +101,49 @@ impl Broker {
       _reply_segs: HashMap::new(),
       arenas: HashMap::new(),
       reply_names: Vec::new(),
-      _singleton_lock: singleton_lock,
     })
   }
 
-  /// Path of the broker singleton lock file (next to the shared segments).
-  const SINGLETON_LOCK_PATH: &'static str = "/dev/shm/impulsed.lock";
-
-  /// Take an exclusive, non-blocking advisory lock so at most one broker runs.
+  /// Ensure at most one broker owns the bus, using the control segment itself
+  /// as the singleton token (no separate lock file — that would be owned by
+  /// whoever created it first and break across `sudo`/non-`sudo` runs).
   ///
-  /// The lock is a `flock` on a small lock file. `flock` is released
-  /// automatically when the file descriptor is closed — on `Drop` for a clean
-  /// shutdown, or by the kernel if the broker crashes — so a stale lock from a
-  /// dead broker never blocks the next one (no PID liveness check needed).
-  fn acquire_singleton_lock() -> Result<std::fs::File, StartError> {
-    use std::io::Write;
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-      .create(true)
-      .write(true)
-      .truncate(false)
-      .open(Self::SINGLETON_LOCK_PATH)
-      .map_err(StartError::Io)?;
-
-    // SAFETY: `file` owns a valid fd for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-      let err = io::Error::last_os_error();
-      return match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK => Err(StartError::AlreadyRunning),
-        _ => Err(StartError::Io(err)),
-      };
+  /// Inspects the existing control segment, if any:
+  /// - a valid segment whose recorded broker PID is still alive ⇒
+  ///   [`StartError::AlreadyRunning`] (leave it untouched);
+  /// - a stale segment (dead PID or not a valid control segment) ⇒ unlink it
+  ///   and let the caller recreate it;
+  /// - no segment ⇒ proceed;
+  /// - a segment we can't even open (`EACCES`, i.e. owned by another user) ⇒
+  ///   assume a foreign live broker and report [`StartError::AlreadyRunning`]
+  ///   rather than failing hard.
+  fn guard_singleton() -> Result<(), StartError> {
+    match Segment::open(util::CONTROL_SEGMENT) {
+      Ok(seg) => {
+        let seg = Arc::new(seg);
+        // A valid, ready control segment with a live PID means a broker is up.
+        if control::attach_control(seg.clone()).is_ok() {
+          let pid = control::broker_pid(&seg);
+          if shm::pid_alive(pid) {
+            return Err(StartError::AlreadyRunning);
+          }
+          log::warn!("found stale control segment from dead broker pid={pid}; reclaiming");
+        } else {
+          log::warn!("found invalid control segment; reclaiming");
+        }
+        drop(seg);
+        let _ = shm::unlink(util::CONTROL_SEGMENT);
+        Ok(())
+      }
+      Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+      Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
+        // The control segment exists but belongs to another user; don't clobber
+        // it and don't crash — treat it as a foreign broker already running.
+        log::warn!("control segment owned by another user; assuming a broker is already running");
+        Err(StartError::AlreadyRunning)
+      }
+      Err(e) => Err(StartError::Io(e)),
     }
-
-    // Record our PID for diagnostics (best-effort; the lock, not the contents,
-    // is what guards the singleton).
-    let _ = writeln!(&file, "{}", std::process::id());
-    Ok(file)
   }
 
   /// Remove any Ring segments left behind by a previous (possibly crashed)
