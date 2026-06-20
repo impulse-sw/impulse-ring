@@ -6,9 +6,7 @@
 
 #![deny(warnings, clippy::todo, clippy::unimplemented)]
 
-mod broker;
-mod registry;
-
+use impulsed::broker::{self, StartError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,7 +16,13 @@ fn main() {
 
   let mut broker = match broker::Broker::start() {
     Ok(b) => b,
-    Err(e) => {
+    Err(StartError::AlreadyRunning) => {
+      // Another broker already owns the bus; nothing to do. Exit cleanly so
+      // supervisors and CI steps don't treat this as a failure.
+      eprintln!("impulsed: another broker is already running; nothing to do");
+      return;
+    }
+    Err(StartError::Io(e)) => {
       eprintln!("impulsed: failed to start: {e}");
       std::process::exit(1);
     }

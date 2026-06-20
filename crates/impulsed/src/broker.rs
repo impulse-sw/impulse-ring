@@ -28,6 +28,40 @@ pub struct Broker {
   /// Names of client-owned reply segments, unlinked when the bus shuts down so
   /// a client that died ungracefully does not leak shared memory.
   reply_names: Vec<String>,
+  /// Held `flock` on the singleton lock file. Kept open for the broker's whole
+  /// lifetime; closing it (on `Drop` or process exit) releases the lock so the
+  /// next broker may take over. Never read — only its existence matters.
+  _singleton_lock: std::fs::File,
+}
+
+/// Why [`Broker::start`] could not bring the broker up.
+#[derive(Debug)]
+pub enum StartError {
+  /// Another `impulsed` is already running and owns the control segment.
+  ///
+  /// Starting a second broker would clobber the live one's shared memory, so
+  /// `start` refuses instead. Callers that merely want *a* broker running can
+  /// treat this as success and carry on.
+  AlreadyRunning,
+  /// An OS error occurred while bringing the broker up.
+  Io(io::Error),
+}
+
+impl std::fmt::Display for StartError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      StartError::AlreadyRunning => write!(f, "another impulsed broker is already running"),
+      StartError::Io(e) => write!(f, "{e}"),
+    }
+  }
+}
+
+impl std::error::Error for StartError {}
+
+impl From<io::Error> for StartError {
+  fn from(e: io::Error) -> Self {
+    StartError::Io(e)
+  }
 }
 
 impl Drop for Broker {
@@ -41,9 +75,18 @@ impl Drop for Broker {
 }
 
 impl Broker {
-  /// Bring up the broker: garbage-collect stale segments from a prior run,
-  /// then create and format the control segment.
-  pub fn start() -> io::Result<Broker> {
+  /// Bring up the broker: acquire the singleton lock, garbage-collect stale
+  /// segments from a prior run, then create and format the control segment.
+  ///
+  /// Returns [`StartError::AlreadyRunning`] if another `impulsed` already holds
+  /// the lock — in that case nothing is touched (in particular the live
+  /// broker's control segment is left intact).
+  pub fn start() -> Result<Broker, StartError> {
+    // The singleton guard MUST come before `cleanup_stale`: that step unlinks
+    // every Ring segment, which would tear the shared memory out from under a
+    // broker that is already serving clients.
+    let singleton_lock = Self::acquire_singleton_lock()?;
+
     Self::cleanup_stale();
     let bytes = control::control_segment_bytes();
     let seg = Arc::new(Segment::create(util::CONTROL_SEGMENT, bytes)?);
@@ -62,7 +105,44 @@ impl Broker {
       _reply_segs: HashMap::new(),
       arenas: HashMap::new(),
       reply_names: Vec::new(),
+      _singleton_lock: singleton_lock,
     })
+  }
+
+  /// Path of the broker singleton lock file (next to the shared segments).
+  const SINGLETON_LOCK_PATH: &'static str = "/dev/shm/impulsed.lock";
+
+  /// Take an exclusive, non-blocking advisory lock so at most one broker runs.
+  ///
+  /// The lock is a `flock` on a small lock file. `flock` is released
+  /// automatically when the file descriptor is closed — on `Drop` for a clean
+  /// shutdown, or by the kernel if the broker crashes — so a stale lock from a
+  /// dead broker never blocks the next one (no PID liveness check needed).
+  fn acquire_singleton_lock() -> Result<std::fs::File, StartError> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+      .create(true)
+      .write(true)
+      .truncate(false)
+      .open(Self::SINGLETON_LOCK_PATH)
+      .map_err(StartError::Io)?;
+
+    // SAFETY: `file` owns a valid fd for the duration of the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+      let err = io::Error::last_os_error();
+      return match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK => Err(StartError::AlreadyRunning),
+        _ => Err(StartError::Io(err)),
+      };
+    }
+
+    // Record our PID for diagnostics (best-effort; the lock, not the contents,
+    // is what guards the singleton).
+    let _ = writeln!(&file, "{}", std::process::id());
+    Ok(file)
   }
 
   /// Remove any Ring segments left behind by a previous (possibly crashed)
