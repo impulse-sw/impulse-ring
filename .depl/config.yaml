@@ -1,5 +1,5 @@
 project_name: impulse-ring
-version: 9
+version: 10
 ignore_files:
   - .git
   - build
@@ -9,30 +9,27 @@ cache_files:
   - target
 variables:
   benchmark-laps:
-    value:
-      type: from_env_var
-      var_name: BENCH_LAPS
+    type: from_env_var
+    var_name: BENCH_LAPS
     fallback: "1000000"
   empty:
-    value:
-      type: plain
-      value: ""
+    type: plain
+    value: ""
   package-connector:
-    value:
-      type: plain
-      value: impulse-ring-connector
+    type: plain
+    value: impulse-ring-connector
   package-core:
-    value:
-      type: plain
-      value: impulse-ring-core
+    type: plain
+    value: impulse-ring-core
+  package-http:
+    type: plain
+    value: impulse-ring-http
   package-impulsed:
-    value:
-      type: plain
-      value: impulsed
+    type: plain
+    value: impulsed
   target-amd64:
-    value:
-      type: plain
-      value: x86_64-unknown-linux-gnu
+    type: plain
+    value: x86_64-unknown-linux-gnu
 actions:
   - info: build-c-connector@0.1.0
     requirements:
@@ -290,11 +287,26 @@ actions:
       cmd: bash -c 'cd connectors/ts && bun build src/index.ts examples/demo.ts --target=bun --outdir=/tmp/ir-ts-build >/dev/null'
       show_success_output: true
 pipelines:
-  - title: common-ops
-    info: impulse-ring-common-ops@0.1.0
+  - title: ops
+    desc: Improve code quality (formatting)
+    info: impulse-ring-ops@0.1.0
+    tags:
+      - cargo
+      - fmt
+    default: true
     actions:
       - title: Format
         used: cargo-fmt@0.1.0
+  - title: quality
+    desc: Check code quality for Impulse Ring (clippy + workspace tests + connector lints)
+    info: impulse-ring-quality@0.1.0
+    tags:
+      - cargo
+      - clippy
+      - lint
+      - test
+    default: true
+    actions:
       - title: Lint `impulse-ring-core`
         used: cargo-lint@0.2.0
         with:
@@ -309,6 +321,13 @@ pipelines:
           "{flags}": empty
           "{package}": package-connector
           "{target}": target-amd64
+      - title: Lint `impulse-ring-http`
+        used: cargo-lint@0.2.0
+        with:
+          "{features}": empty
+          "{flags}": empty
+          "{package}": package-http
+          "{target}": target-amd64
       - title: Lint `impulsed`
         used: cargo-lint@0.2.0
         with:
@@ -318,27 +337,6 @@ pipelines:
           "{target}": target-amd64
       - title: Test Impulse Ring (Rust)
         used: cargo-test@0.2.0
-      - title: Build `impulsed`
-        used: cargo-release@0.2.0
-        with:
-          "{flags}": empty
-          "{package}": package-impulsed
-          "{target}": target-amd64
-    artifacts:
-      - from: target/x86_64-unknown-linux-gnu/release/impulsed
-        to: impulsed
-  - title: demo
-    info: impulse-ring-demo@0.1.0
-    actions:
-      - title: Run `impulsed`
-        used: run-impulsed-daemon@0.1.0
-      - title: Run test
-        used: run-connector-demo@0.1.0
-      - title: Run test second time
-        used: run-connector-demo@0.1.0
-  - title: lint-connectors
-    info: impulse-ring-lint-connectors@0.1.0
-    actions:
       - title: Check C/C++ format (clang-format)
         used: clang-format-check@0.1.0
       - title: Lint C (clang-tidy)
@@ -353,8 +351,53 @@ pipelines:
         used: go-vet@0.1.0
       - title: Check TS (bun build)
         used: ts-check@0.1.0
+    gh_opts:
+      on_push_branches:
+        - stable
+        - unstable
+      on_pull_requests_branches:
+        - unstable
+      preflight_steps:
+        - name: Install Rust Toolchain for x86_64
+          uses: actions-rust-lang/setup-rust-toolchain@v1
+          with:
+            target: x86_64-unknown-linux-gnu
+            toolchain: nightly
+            components: clippy
+  - title: build-impulsed
+    desc: Build the `impulsed` broker and save it as an artifact.
+    info: impulse-ring-build-impulsed@0.1.0
+    tags:
+      - cargo
+      - build
+    default: false
+    actions:
+      - title: Build `impulsed`
+        used: cargo-release@0.2.0
+        with:
+          "{flags}": empty
+          "{package}": package-impulsed
+          "{target}": target-amd64
+    artifacts:
+      - from: target/x86_64-unknown-linux-gnu/release/impulsed
+        to: impulsed
+    run_tag: staging
+  - title: demo
+    desc: Run the broker and the Rust connector demo against it.
+    info: impulse-ring-demo@0.1.0
+    default: false
+    actions:
+      - title: Run `impulsed`
+        used: run-impulsed-daemon@0.1.0
+      - title: Run test
+        used: run-connector-demo@0.1.0
+      - title: Run test second time
+        used: run-connector-demo@0.1.0
+    run_tag: production
   - title: connector-examples
+    desc: Build and run every language connector against a live broker.
     info: impulse-ring-connector-examples@0.1.0
+    default: false
     actions:
       - title: Build C connector
         used: build-c-connector@0.1.0
@@ -374,8 +417,11 @@ pipelines:
         used: run-go-demo@0.1.0
       - title: Run TS example
         used: run-ts-demo@0.1.0
+    run_tag: production
   - title: benchmark
+    desc: Cross-language ring relay benchmark.
     info: impulse-ring-benchmark@0.1.0
+    default: false
     actions:
       - title: Cross-language ring relay benchmark
         used: run-benchmark-all@0.1.0
@@ -385,3 +431,4 @@ pipelines:
         used: run-benchmark-compiled@0.1.0
         with:
           "{laps}": benchmark-laps
+    run_tag: production

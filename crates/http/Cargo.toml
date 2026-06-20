@@ -1,0 +1,10 @@
+[package]
+name = "impulse-ring-http"
+description = "HTTP-over-Ring wire protocol: Avro request/response records shared by the Ring HTTP listener and client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true

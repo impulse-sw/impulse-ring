@@ -3,18 +3,20 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/connector",
+    "crates/http",
     "crates/impulsed",
     "benchmark/rust",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
 impulse-ring-core = { path = "crates/core" }
 impulse-ring-connector = { path = "crates/connector" }
+impulse-ring-http = { path = "crates/http" }
 
 libc = "0.2"
 apache-avro = "0.17"
