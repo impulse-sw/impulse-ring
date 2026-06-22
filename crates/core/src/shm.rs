@@ -16,6 +16,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 pub const SHM_DIR: &str = "/dev/shm";
 /// Common prefix for every segment owned by Ring, used for crash cleanup scans.
 pub const NAME_PREFIX: &str = "impulse-ring.";
+/// Permission bits for Ring segments: world read/write.
+///
+/// Ring is socket-free, single-machine IPC: peers rendezvous purely through
+/// `/dev/shm` names. Those peers routinely run as *different* users (e.g. an
+/// LBRP front under root talking to an `impulsed` broker under a service user),
+/// and a peer that only opens a foreign segment still needs `O_RDWR` on it to
+/// push replies. Owner-only bits (`0o600`) make any cross-UID open fail with
+/// `EACCES`, so we deliberately open the segments to everyone on the host.
+const SEGMENT_MODE: libc::mode_t = 0o666;
 
 /// An mmap'd POSIX shared-memory segment.
 pub struct Segment {
@@ -36,11 +45,18 @@ impl Segment {
   pub fn create(name: &str, size: usize) -> io::Result<Segment> {
     debug_assert!(name.starts_with('/'), "shm name must start with '/'");
     let cname = CString::new(name).map_err(|_| io::Error::other("nul in shm name"))?;
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600 as libc::c_uint) };
+    let fd =
+      unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, SEGMENT_MODE as libc::c_uint) };
     if fd < 0 {
       return Err(io::Error::last_os_error());
     }
     let res = (|| {
+      // `shm_open` masks the requested mode by the process umask, which would
+      // typically strip the group/other write bits we need for cross-UID peers.
+      // `fchmod` sets the final bits unconditionally.
+      if unsafe { libc::fchmod(fd, SEGMENT_MODE) } < 0 {
+        return Err(io::Error::last_os_error());
+      }
       if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
         return Err(io::Error::last_os_error());
       }
