@@ -98,6 +98,9 @@ impl Connection {
         nonce: nonce as i64,
         reply_segment: reply_name,
         heartbeat_ms: 1000,
+        // Report our pid so the broker can reclaim our names if we die without
+        // unregistering (crash / SIGKILL) and later restart.
+        pid: std::process::id() as i64,
       },
     )?;
     let reply = conn.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;

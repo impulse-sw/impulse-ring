@@ -2,7 +2,7 @@
 
 | Message | Fingerprint (u64, hex) |
 |---------|------------------------|
-| `Register` | `0xfc723bd7afcffc02` |
+| `Register` | `0x879b416683ef2068` |
 | `RegisterReply` | `0x3af224883f4dec77` |
 | `Unregister` | `0x82cdc2b7ebd36a6a` |
 | `PublishChannel` | `0xf271a4c7a09fcdd7` |
@@ -18,3 +18,13 @@
 | `Heartbeat` | `0xa5073570fc81a3ea` |
 | `RpcRequest` | `0xe88f548e4f540ca4` |
 | `RpcResponse` | `0x5c4e149239ad5d24` |
+
+## Legacy fingerprints (accepted for backward compatibility)
+
+The broker still recognizes these superseded fingerprints and decodes such
+frames with their original schema (newer fields default), so a newer broker can
+serve not-yet-upgraded connectors.
+
+| Message | Legacy fingerprint | Superseded by |
+|---------|--------------------|---------------|
+| `Register` (pre-`pid`) | `0xfc723bd7afcffc02` | added `pid` (`long`, default `0`) |

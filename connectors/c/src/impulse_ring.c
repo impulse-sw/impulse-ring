@@ -52,7 +52,7 @@
 #define FRAME_HEADER 16u
 
 /* Control schema fingerprints (from spec/schemas/FINGERPRINTS.md). */
-#define FP_REGISTER 0xfc723bd7afcffc02ull
+#define FP_REGISTER 0x879b416683ef2068ull
 #define FP_REGISTER_REPLY 0x3af224883f4dec77ull
 #define FP_UNREGISTER 0x82cdc2b7ebd36a6aull
 #define FP_PUBLISH 0xf271a4c7a09fcdd7ull
@@ -882,6 +882,7 @@ ir_conn *ir_connect(const char *app_name) {
   ir_avro_put_long(w, nonce);
   ir_avro_put_string(w, reply_name);
   ir_avro_put_long(w, 1000);
+  ir_avro_put_long(w, (int64_t)getpid()); /* pid: lets the broker reclaim our names if we die without unregistering */
   size_t blen;
   const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;

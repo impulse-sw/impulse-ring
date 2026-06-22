@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,6 +168,7 @@ func (c *Connection) register(appName string, nonce int64) error {
 	e.PutLong(nonce)
 	e.PutString(c.replyName)
 	e.PutLong(1000)
+	e.PutLong(int64(os.Getpid())) // pid: lets the broker reclaim our names if we die without unregistering
 	r, err := c.controlCall(fpRegister, e.Bytes(), corr, 5000)
 	if err != nil {
 		return err

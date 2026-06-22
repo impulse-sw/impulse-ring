@@ -1,5 +1,5 @@
 [
-{"type":"record","name":"Register","namespace":"ring.proto","fields":[{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}]},
+{"type":"record","name":"Register","namespace":"ring.proto","fields":[{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"},{"name":"pid","type":"long","default":0}]},
 {"type":"record","name":"RegisterReply","namespace":"ring.proto","fields":[{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"status","type":"int"},{"name":"message","type":"string"}]},
 {"type":"record","name":"Unregister","namespace":"ring.proto","fields":[{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"}]},
 {"type":"record","name":"PublishChannel","namespace":"ring.proto","fields":[{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"channel","type":"string"},{"name":"schema_json","type":"string"},{"name":"access_key","type":"string"}]},

@@ -199,15 +199,17 @@ impl Broker {
   }
 
   fn on_register(&mut self, frame: &Frame) -> io::Result<()> {
-    let m: proto::Register = proto::from_frame(Kind::Register, frame)?;
+    // `from_frame_compat` lets a newer broker still decode an older connector's
+    // Register (the pre-`pid` schema); `pid` then defaults to 0 ("unknown").
+    let m: proto::Register = proto::from_frame_compat(frame)?;
     // Attach to the reply segment the client created during bootstrap.
     let seg = Arc::new(Segment::open(&m.reply_segment)?);
     let ring = Ring::attach(seg.clone(), 0)?;
-    let client_id = self.reg.add_client(m.app_name.clone());
+    let client_id = self.reg.add_client(m.app_name.clone(), m.pid as i32);
     self.reply_rings.insert(client_id, ring);
     self._reply_segs.insert(client_id, seg);
     self.reply_names.push(m.reply_segment.clone());
-    log::info!("registered '{}' as client {client_id}", m.app_name);
+    log::info!("registered '{}' as client {client_id} pid={}", m.app_name, m.pid);
     self.reply(
       client_id,
       Kind::RegisterReply,
@@ -224,6 +226,16 @@ impl Broker {
     let m: proto::Unregister = proto::from_frame(Kind::Unregister, frame)?;
     self.release_client(m.client_id);
     Ok(())
+  }
+
+  /// Liveness policy for a name's owner, by its registered pid.
+  ///
+  /// Pid `0` means "unknown" (an older connector that does not report its pid);
+  /// we conservatively treat it as alive so a name is never reclaimed unless we
+  /// positively observe the owning process is gone. Real pids are probed with
+  /// `kill(pid, 0)` via [`shm::pid_alive`].
+  fn owner_alive(pid: i32) -> bool {
+    pid == 0 || shm::pid_alive(pid)
   }
 
   /// Reclaim everything a departing client owned: its channels and functions
@@ -259,18 +271,31 @@ impl Broker {
   fn on_publish(&mut self, frame: &Frame) -> io::Result<()> {
     let m: proto::PublishChannel = proto::from_frame(Kind::PublishChannel, frame)?;
     if self.reg.channel_name_taken(&m.channel) {
-      return self.reply(
-        m.client_id,
-        Kind::PublishReply,
-        &proto::PublishReply {
-          correlation_id: m.correlation_id,
-          channel_id: 0,
-          schema_fp: 0,
-          arena: String::new(),
-          status: status::ERR_EXISTS,
-          message: "channel already exists".into(),
-        },
-      );
+      // As with functions: reclaim the channel name if its owner has died.
+      match self.reg.dead_channel_owner(&m.channel, Self::owner_alive) {
+        Some(dead) => {
+          log::warn!(
+            "reclaiming channel '{}' from dead owner client={dead}; re-publishing for client {}",
+            m.channel,
+            m.client_id
+          );
+          self.release_client(dead);
+        }
+        None => {
+          return self.reply(
+            m.client_id,
+            Kind::PublishReply,
+            &proto::PublishReply {
+              correlation_id: m.correlation_id,
+              channel_id: 0,
+              schema_fp: 0,
+              arena: String::new(),
+              status: status::ERR_EXISTS,
+              message: "channel already exists".into(),
+            },
+          );
+        }
+      }
     }
     let (_schema, fp) = match impulse_ring_core::avro::parse(&m.schema_json) {
       Ok(v) => v,
@@ -355,11 +380,27 @@ impl Broker {
   fn on_expose(&mut self, frame: &Frame) -> io::Result<()> {
     let m: proto::ExposeFunction = proto::from_frame(Kind::ExposeFunction, frame)?;
     if self.reg.function_name_taken(&m.fn_name) {
-      return self.reply(
-        m.client_id,
-        Kind::ExposeReply,
-        &err_expose(m.correlation_id, status::ERR_EXISTS, "function exists"),
-      );
+      // The name is taken — but if its owner has died (e.g. a previous instance
+      // was SIGKILLed or crashed before it could unregister), reclaim it so this
+      // restart can re-expose. Only reclaim when we positively know the owner is
+      // gone: an unknown pid (0, legacy connector) is treated as alive.
+      match self.reg.dead_function_owner(&m.fn_name, Self::owner_alive) {
+        Some(dead) => {
+          log::warn!(
+            "reclaiming function '{}' from dead owner client={dead}; re-exposing for client {}",
+            m.fn_name,
+            m.client_id
+          );
+          self.release_client(dead);
+        }
+        None => {
+          return self.reply(
+            m.client_id,
+            Kind::ExposeReply,
+            &err_expose(m.correlation_id, status::ERR_EXISTS, "function exists"),
+          );
+        }
+      }
     }
     let req = impulse_ring_core::avro::parse(&m.req_schema_json);
     let resp = impulse_ring_core::avro::parse(&m.resp_schema_json);

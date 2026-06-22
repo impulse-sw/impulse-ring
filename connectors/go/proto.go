@@ -14,7 +14,7 @@ const (
 var ctlMagic = []byte("IMPRING\x00")
 
 const (
-	fpRegister      = 0xFC723BD7AFCFFC02
+	fpRegister      = 0x879B416683EF2068
 	fpRegisterReply = 0x3AF224883F4DEC77
 	fpUnregister    = 0x82CDC2B7EBD36A6A
 	fpPublish       = 0xF271A4C7A09FCDD7

@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 pub struct ClientMeta {
   pub app_name: String,
+  /// OS process id reported by the client at registration. `0` means unknown
+  /// (an older connector that predates the `pid` field).
+  pub pid: i32,
 }
 
 pub struct ChannelMeta {
@@ -56,11 +59,34 @@ impl Registry {
     }
   }
 
-  pub fn add_client(&mut self, app_name: String) -> i64 {
+  pub fn add_client(&mut self, app_name: String, pid: i32) -> i64 {
     let id = self.next_client;
     self.next_client += 1;
-    self.clients.insert(id, ClientMeta { app_name });
+    self.clients.insert(id, ClientMeta { app_name, pid });
     id
+  }
+
+  /// If `name` is exposed by a function whose owner is *not* alive (per the
+  /// `alive` predicate, called with the owner's stored pid), return that owner's
+  /// client id so the caller can release it and free the name. Returns `None`
+  /// when the name is free or its owner is still considered alive.
+  ///
+  /// The pid policy lives in the caller's predicate: the broker passes one that
+  /// treats pid `0` (unknown / legacy connector) as alive, so a name is never
+  /// reclaimed unless we positively know its owner has died.
+  pub fn dead_function_owner(&self, name: &str, alive: impl Fn(i32) -> bool) -> Option<i64> {
+    let fid = *self.fn_by_name.get(name)?;
+    let owner = self.functions.get(&fid)?.owner;
+    let pid = self.clients.get(&owner).map(|c| c.pid).unwrap_or(0);
+    (!alive(pid)).then_some(owner)
+  }
+
+  /// Channel counterpart of [`dead_function_owner`].
+  pub fn dead_channel_owner(&self, name: &str, alive: impl Fn(i32) -> bool) -> Option<i64> {
+    let cid = *self.chan_by_name.get(name)?;
+    let owner = self.channels.get(&cid)?.owner;
+    let pid = self.clients.get(&owner).map(|c| c.pid).unwrap_or(0);
+    (!alive(pid)).then_some(owner)
   }
 
   pub fn remove_client(&mut self, id: i64) {
@@ -233,6 +259,51 @@ mod tests {
     assert!(check_fp(0, 123).is_ok()); // no expectation
     assert!(check_fp(123, 123).is_ok());
     assert_eq!(check_fp(123, 456).unwrap_err().0, status::ERR_SCHEMA_MISMATCH);
+  }
+
+  #[test]
+  fn dead_owner_detection() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 4242);
+    let fid = r.alloc_fn_id();
+    r.insert_function(FunctionMeta {
+      id: fid,
+      name: "svc.http".into(),
+      owner,
+      req_fp: 1,
+      resp_fp: 2,
+      key: None,
+      req_arena: "/impulse-ring.fn.1.v1".into(),
+    });
+
+    // Free name → never a dead owner.
+    assert_eq!(r.dead_function_owner("absent", |_| false), None);
+    // Owner reported alive → keep the name (refuse the new expose).
+    assert_eq!(r.dead_function_owner("svc.http", |_| true), None);
+    // Owner reported dead → hand back its id so the caller can reclaim.
+    assert_eq!(r.dead_function_owner("svc.http", |_| false), Some(owner));
+    // The predicate sees the stored pid.
+    assert_eq!(r.dead_function_owner("svc.http", |pid| pid == 4242), None);
+    assert_eq!(r.dead_function_owner("svc.http", |pid| pid != 4242), Some(owner));
+  }
+
+  #[test]
+  fn unknown_pid_is_treated_per_predicate() {
+    // A legacy client registers with pid 0. With the broker's real policy
+    // (`pid == 0 || pid_alive(pid)`), pid 0 counts as alive → never reclaimed.
+    let mut r = Registry::new();
+    let owner = r.add_client("legacy".into(), 0);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "legacy.events".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+    let broker_alive = |pid: i32| pid == 0 || pid == 12345 /* stand-in for pid_alive */;
+    assert_eq!(r.dead_channel_owner("legacy.events", broker_alive), None);
   }
 
   #[test]

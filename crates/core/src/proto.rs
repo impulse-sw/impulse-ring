@@ -70,6 +70,13 @@ pub struct Register {
   pub nonce: i64,
   pub reply_segment: String,
   pub heartbeat_ms: i64,
+  /// OS process id of the registering client, used by the broker to detect when
+  /// the owner of a name (function/channel) has died so the name can be
+  /// reclaimed on a restart. `0` means "unknown" (e.g. an older connector that
+  /// predates this field); the broker then conservatively treats the owner as
+  /// alive and never reclaims on its behalf.
+  #[serde(default)]
+  pub pid: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -241,7 +248,7 @@ fn schema_for(kind: Kind) -> &'static str {
   match kind {
     Kind::Register => schema_json!(
       "Register",
-      r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+      r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"},{"name":"pid","type":"long","default":0}"#
     ),
     Kind::RegisterReply => schema_json!(
       "RegisterReply",
@@ -309,6 +316,24 @@ fn schema_for(kind: Kind) -> &'static str {
   }
 }
 
+/// Superseded schemas still accepted on the wire for backward compatibility.
+///
+/// Each entry is `(kind, json)` for a schema version that predates the current
+/// one. A newer broker registers their fingerprints (routing them to the same
+/// [`Kind`]) and keeps their writer schemas so it can still decode frames from
+/// an older connector; fields added since are filled from the current struct's
+/// `#[serde(default)]`. This lets the broker be upgraded ahead of connectors.
+fn legacy_schemas() -> &'static [(Kind, &'static str)] {
+  &[(
+    // Register v1: before the `pid` field (owner-liveness reaping) was added.
+    Kind::Register,
+    schema_json!(
+      "Register",
+      r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+    ),
+  )]
+}
+
 const ALL_KINDS: [Kind; 16] = [
   Kind::Register,
   Kind::RegisterReply,
@@ -333,6 +358,9 @@ pub struct Catalog {
   schemas: HashMap<Kind, apache_avro::Schema>,
   fps: HashMap<Kind, Fingerprint>,
   by_fp: HashMap<Fingerprint, Kind>,
+  /// Writer schema for every known fingerprint — current *and* legacy — so a
+  /// frame can be decoded with the exact schema it was written with.
+  writer_schemas: HashMap<Fingerprint, apache_avro::Schema>,
 }
 
 impl Catalog {
@@ -340,13 +368,28 @@ impl Catalog {
     let mut schemas = HashMap::new();
     let mut fps = HashMap::new();
     let mut by_fp = HashMap::new();
+    let mut writer_schemas = HashMap::new();
     for k in ALL_KINDS {
       let (schema, fp) = avro::parse(schema_for(k)).expect("control schema must parse");
+      writer_schemas.insert(fp, schema.clone());
       schemas.insert(k, schema);
       fps.insert(k, fp);
       by_fp.insert(fp, k);
     }
-    Catalog { schemas, fps, by_fp }
+    // Accept frames written with a superseded schema version, decoded with that
+    // version's writer schema. Current schemas win on fingerprint collisions
+    // (there are none, since fields differ).
+    for (k, json) in legacy_schemas() {
+      let (schema, fp) = avro::parse(json).expect("legacy control schema must parse");
+      by_fp.entry(fp).or_insert(*k);
+      writer_schemas.entry(fp).or_insert(schema);
+    }
+    Catalog {
+      schemas,
+      fps,
+      by_fp,
+      writer_schemas,
+    }
   }
 
   pub fn schema(&self, k: Kind) -> &apache_avro::Schema {
@@ -357,6 +400,10 @@ impl Catalog {
   }
   pub fn kind_of(&self, fp: Fingerprint) -> Option<Kind> {
     self.by_fp.get(&fp).copied()
+  }
+  /// The writer schema registered for `fp` (current or legacy), if known.
+  pub fn writer_schema(&self, fp: Fingerprint) -> Option<&apache_avro::Schema> {
+    self.writer_schemas.get(&fp)
   }
 }
 
@@ -377,6 +424,19 @@ pub fn to_frame<T: Serialize>(kind: Kind, msg: &T) -> io::Result<Frame> {
 pub fn from_frame<T: DeserializeOwned>(kind: Kind, frame: &Frame) -> io::Result<T> {
   let c = catalog();
   avro::decode(c.schema(kind), &frame.body)
+}
+
+/// Decode a frame using the writer schema matching its fingerprint, tolerating
+/// superseded schema versions. Use this for messages whose schema may have
+/// evolved (e.g. `Register`): an older connector's frame is decoded with its own
+/// writer schema, and any field added since is supplied by the struct's
+/// `#[serde(default)]`.
+pub fn from_frame_compat<T: DeserializeOwned>(frame: &Frame) -> io::Result<T> {
+  let c = catalog();
+  let schema = c
+    .writer_schema(frame.schema_fp)
+    .ok_or_else(|| io::Error::other("unknown frame fingerprint"))?;
+  avro::decode(schema, &frame.body)
 }
 
 /// Extract the `correlation_id` from any reply/response frame, used by a
@@ -426,12 +486,59 @@ mod tests {
       nonce: 999,
       reply_segment: "/impulse-ring.cli.999.v1".into(),
       heartbeat_ms: 1000,
+      pid: 4242,
     };
     let frame = to_frame(Kind::Register, &msg).unwrap();
     assert_eq!(catalog().kind_of(frame.schema_fp), Some(Kind::Register));
     let back: Register = from_frame(Kind::Register, &frame).unwrap();
     assert_eq!(back.app_name, "svc-a");
     assert_eq!(back.nonce, 999);
+    assert_eq!(back.pid, 4242);
+  }
+
+  // A `Register` frame written by an older connector (schema without `pid`) must
+  // still be routed to `Kind::Register` and decode via `from_frame_compat`, with
+  // `pid` defaulting to 0 — the broker then treats the owner as alive (never
+  // reclaims on its behalf). This is what keeps a newer broker compatible with
+  // not-yet-upgraded connectors.
+  #[test]
+  fn legacy_register_frame_decodes_with_default_pid() {
+    // The pre-`pid` Register schema, exactly as an old connector ships it.
+    let legacy_json = schema_json!(
+      "Register",
+      r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+    );
+    let (legacy_schema, legacy_fp) = avro::parse(legacy_json).unwrap();
+
+    // The legacy fingerprint differs from the current one but still maps to
+    // `Register`, and its writer schema is retained for decoding.
+    assert_ne!(legacy_fp, catalog().fp(Kind::Register));
+    assert_eq!(catalog().kind_of(legacy_fp), Some(Kind::Register));
+
+    #[derive(serde::Serialize)]
+    struct RegisterV1 {
+      correlation_id: i64,
+      app_name: String,
+      nonce: i64,
+      reply_segment: String,
+      heartbeat_ms: i64,
+    }
+    let body = avro::encode(
+      &legacy_schema,
+      &RegisterV1 {
+        correlation_id: 7,
+        app_name: "old-svc".into(),
+        nonce: 1,
+        reply_segment: "/impulse-ring.cli.1.v1".into(),
+        heartbeat_ms: 1000,
+      },
+    )
+    .unwrap();
+    let frame = Frame::new(legacy_fp, body);
+
+    let back: Register = from_frame_compat(&frame).unwrap();
+    assert_eq!(back.app_name, "old-svc");
+    assert_eq!(back.pid, 0);
   }
 
   #[test]

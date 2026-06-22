@@ -8,6 +8,7 @@ Per project policy, schema fingerprints are computed by the broker: we send
 schema JSON and use the fingerprints the broker returns.
 """
 
+import os
 import secrets
 import threading
 from collections import namedtuple
@@ -92,6 +93,8 @@ class Connection:
         e.put_long(self._nonce)
         e.put_string(self._reply_name)
         e.put_long(1000)
+        # pid: lets the broker reclaim our names if we die without unregistering.
+        e.put_long(os.getpid())
         _, body = self._control_call(proto.FP_REGISTER, e.getvalue(), corr, 5.0)
         d = avro.Decoder(body)
         d.get_long()

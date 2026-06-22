@@ -4,8 +4,15 @@
 
 use impulse_ring_connector::Connection;
 use serde::{Deserialize, Serialize};
-use std::process::{Child, Command};
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+/// Env flag that turns a re-exec of this test binary into the "victim": it
+/// registers, exposes a function, prints a readiness marker, then idles forever
+/// so the parent can SIGKILL it (no graceful `Unregister`) to simulate a crash.
+const VICTIM_ENV: &str = "RING_E2E_VICTIM";
+const VICTIM_READY: &str = "VICTIM_READY";
 
 const METRIC_SCHEMA: &str = r#"{
   "type":"record","name":"Metric","namespace":"ring.test",
@@ -85,8 +92,34 @@ fn start_broker() -> BrokerGuard {
   panic!("broker did not come up");
 }
 
+/// The victim role (a separate process): expose `crash.add` against the broker
+/// the parent already started, announce readiness, then block until killed.
+/// Crucially it never returns, so `Connection::drop` (and thus `Unregister`)
+/// never runs — exactly what a `SIGKILL`/crash looks like to the broker.
+fn run_victim() -> ! {
+  let conn = Connection::connect("crash-victim").expect("victim connect");
+  conn
+    .expose_function::<AddReq, AddResp, _>("crash.add", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |req| AddResp {
+      sum: req.a + req.b,
+    })
+    .expect("victim expose");
+  // Flush a readiness marker the parent waits for before killing us.
+  println!("{VICTIM_READY}");
+  use std::io::Write;
+  let _ = std::io::stdout().flush();
+  loop {
+    std::thread::sleep(Duration::from_secs(3600));
+  }
+}
+
 #[test]
 fn full_flow_pubsub_and_rpc() {
+  // If re-exec'd as the victim, take that role and never come back (no broker,
+  // no Unregister) — see `crash_reclaim` section below.
+  if std::env::var(VICTIM_ENV).is_ok() {
+    run_victim();
+  }
+
   // Segments already present belong to a concurrent test binary or a live Ring
   // deployment on this host, not to us. Snapshot them so the leak check below
   // judges only what *this* test created, instead of asserting a clean global
@@ -189,6 +222,66 @@ fn full_flow_pubsub_and_rpc() {
         sum: req.a + req.b,
       })
       .expect("re-expose after the previous owner left");
+  }
+  std::thread::sleep(Duration::from_millis(100));
+
+  // --- Crash reclaim: a function whose owner *died without unregistering* must
+  // be reclaimable on restart (the SIGKILL/crash case, distinct from the
+  // graceful path above). Spawn a victim child that exposes `crash.add`, kill it
+  // with SIGKILL so no Unregister is sent, then re-expose `crash.add` from this
+  // (live, different-pid) process. The broker must notice the dead owner via its
+  // pid and reclaim the name.
+  {
+    let mut victim = Command::new(std::env::current_exe().expect("current exe"))
+      .args(["full_flow_pubsub_and_rpc", "--exact", "--nocapture"])
+      .env(VICTIM_ENV, "1")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn victim");
+
+    // Wait until the victim has exposed `crash.add`.
+    let stdout = victim.stdout.take().expect("victim stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut ready = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+      let mut line = String::new();
+      if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        break; // victim exited unexpectedly
+      }
+      if line.contains(VICTIM_READY) {
+        ready = true;
+        break;
+      }
+    }
+    assert!(ready, "victim never became ready");
+
+    // Before reclaim: the name is owned by a *live* process, so re-exposing it
+    // is refused — this proves we only reclaim once the owner is actually gone.
+    {
+      let contender = Connection::connect("crash-contender").expect("contender connect");
+      let refused =
+        contender.expose_function::<AddReq, AddResp, _>("crash.add", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |req| {
+          AddResp { sum: req.a + req.b }
+        });
+      assert!(refused.is_err(), "must not steal a name from a live owner");
+    }
+
+    // Now crash the victim: SIGKILL skips destructors, so the broker never sees
+    // an Unregister and `crash.add` stays registered under the dead pid.
+    let vpid = victim.id() as i32;
+    unsafe { libc::kill(vpid, libc::SIGKILL) };
+    victim.wait().expect("reap victim");
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The restart: a fresh process re-exposes the same function. The broker
+    // detects the previous owner's pid is dead and reclaims the name.
+    let reborn = Connection::connect("crash-reborn").expect("reborn connect");
+    reborn
+      .expose_function::<AddReq, AddResp, _>("crash.add", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |req| AddResp {
+        sum: req.a + req.b,
+      })
+      .expect("re-expose after the previous owner crashed (pid reclaim)");
   }
   std::thread::sleep(Duration::from_millis(100));
 
