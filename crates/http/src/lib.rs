@@ -198,6 +198,34 @@ pub const HEADER_CHAN_DATAGRAMS: &str = "x-impulse-ring-chan-datagrams";
 /// Header carrying the opaque session id chosen for this upgrade.
 pub const HEADER_SESSION: &str = "x-impulse-ring-session";
 
+/// Response header naming a channel that carries a **chunked response body**.
+///
+/// A unary RPC response travels as a single reply-ring record, so a body that
+/// would exceed the reply ring cannot be returned inline. When the server
+/// produces such a body it publishes a Ring channel, streams the body onto it as
+/// [`RingStreamFrame`] [`opcode::DATA`] chunks terminated by [`opcode::CLOSE`],
+/// and sets this header on an otherwise normal [`RingHttpResponse`] (with an
+/// empty inline `body`). The client subscribes to the named channel, reassembles
+/// the chunks into the full body and strips this header — so the chunking is
+/// transparent to HTTP consumers (including the LBRP `impring://` connector).
+///
+/// This is orthogonal to [`HEADER_UPGRADE`]: it carries a *finite* body, not a
+/// live SSE/WebSocket stream.
+pub const HEADER_BODY_CHANNEL: &str = "x-impulse-ring-body-chan";
+
+/// Largest response body the server returns inline through the reply ring.
+///
+/// Kept comfortably under `impulse_ring_core::control::REPLY_CAP` (512 KiB) to
+/// leave room for the status, headers and Avro framing in the same record.
+/// Bodies above this are streamed over a channel named by [`HEADER_BODY_CHANNEL`].
+pub const MAX_INLINE_RESPONSE_BODY: usize = 448 * 1024;
+
+/// Chunk size used when streaming a large body over a body channel.
+///
+/// Kept under `impulse_ring_core::control::ARENA_CAP` (256 KiB) so each frame
+/// fits the channel's data arena with room for framing.
+pub const RESPONSE_BODY_CHUNK: usize = 192 * 1024;
+
 /// Prefix for channels carrying HTTP-over-Ring stream data.
 pub const STREAM_CHAN_PREFIX: &str = "impulse-ring-http/v1/stream/";
 

@@ -45,8 +45,13 @@ impl Segment {
   pub fn create(name: &str, size: usize) -> io::Result<Segment> {
     debug_assert!(name.starts_with('/'), "shm name must start with '/'");
     let cname = CString::new(name).map_err(|_| io::Error::other("nul in shm name"))?;
-    let fd =
-      unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, SEGMENT_MODE as libc::c_uint) };
+    let fd = unsafe {
+      libc::shm_open(
+        cname.as_ptr(),
+        libc::O_CREAT | libc::O_RDWR,
+        SEGMENT_MODE as libc::c_uint,
+      )
+    };
     if fd < 0 {
       return Err(io::Error::last_os_error());
     }

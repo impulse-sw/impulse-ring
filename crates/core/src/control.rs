@@ -32,7 +32,12 @@ pub const SUBMISSION_BASE: usize = 64;
 pub const SUBMISSION_CAP: usize = 1 << 16;
 
 /// Default reply-ring capacity for a per-client reply segment.
-pub const REPLY_CAP: usize = 1 << 16;
+///
+/// A reply (control reply or unary RPC response) is delivered as a single ring
+/// record, so this is the hard ceiling on an RPC response size. 512 KiB keeps
+/// typical HTTP responses (assets, JSON pages) inline; larger bodies are chunked
+/// over a channel by the HTTP layer (`impulse-ring-http`).
+pub const REPLY_CAP: usize = 1 << 19;
 /// Default data-arena capacity for channels and function request rings.
 pub const ARENA_CAP: usize = 1 << 18;
 

@@ -56,6 +56,18 @@ impl Drop for BrokerGuard {
   }
 }
 
+/// Snapshot the Ring segment names currently present in `/dev/shm`.
+fn scan_ring_segments() -> std::collections::HashSet<String> {
+  std::fs::read_dir("/dev/shm")
+    .map(|rd| {
+      rd.filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("impulse-ring."))
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
 fn start_broker() -> BrokerGuard {
   let child = Command::new(env!("CARGO_BIN_EXE_impulsed"))
     .spawn()
@@ -75,6 +87,12 @@ fn start_broker() -> BrokerGuard {
 
 #[test]
 fn full_flow_pubsub_and_rpc() {
+  // Segments already present belong to a concurrent test binary or a live Ring
+  // deployment on this host, not to us. Snapshot them so the leak check below
+  // judges only what *this* test created, instead of asserting a clean global
+  // `/dev/shm` (which fails whenever anything else on the machine uses Ring).
+  let preexisting = scan_ring_segments();
+
   let _broker = start_broker();
 
   {
@@ -174,15 +192,19 @@ fn full_flow_pubsub_and_rpc() {
   }
   std::thread::sleep(Duration::from_millis(100));
 
-  // Shut the broker down and confirm it cleaned up its segments.
+  // Shut the broker down and confirm it cleaned up its segments. Our own
+  // segments unlink synchronously as the broker and connections drop; poll a few
+  // times so any concurrent foreign churn settles before we judge, and ignore
+  // anything that was already there when we started.
   drop(_broker);
-  std::thread::sleep(Duration::from_millis(200));
-  let leftovers: Vec<_> = std::fs::read_dir("/dev/shm")
-    .unwrap()
-    .filter_map(|e| e.ok())
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .filter(|n| n.starts_with("impulse-ring."))
-    .collect();
+  let mut leftovers: Vec<String> = Vec::new();
+  for _ in 0..20 {
+    std::thread::sleep(Duration::from_millis(50));
+    leftovers = scan_ring_segments().difference(&preexisting).cloned().collect();
+    if leftovers.is_empty() {
+      break;
+    }
+  }
   assert!(
     leftovers.is_empty(),
     "shared memory leaked after shutdown: {leftovers:?}"
