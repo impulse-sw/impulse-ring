@@ -46,6 +46,27 @@ struct AddResp {
   sum: i64,
 }
 
+const BLOB_REQ_SCHEMA: &str = r#"{
+  "type":"record","name":"BlobReq","namespace":"ring.test",
+  "fields":[{"name":"data","type":"bytes"}]
+}"#;
+
+const BLOB_RESP_SCHEMA: &str = r#"{
+  "type":"record","name":"BlobResp","namespace":"ring.test",
+  "fields":[{"name":"len","type":"long"}]
+}"#;
+
+#[derive(Serialize, Deserialize)]
+struct BlobReq {
+  #[serde(with = "serde_bytes")]
+  data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BlobResp {
+  len: i64,
+}
+
 /// RAII guard that SIGTERMs the broker and reaps it.
 struct BrokerGuard(Child);
 impl Drop for BrokerGuard {
@@ -206,6 +227,51 @@ fn full_flow_pubsub_and_rpc() {
       Duration::from_secs(2),
     );
     assert!(denied_call.is_err(), "call with wrong key must fail");
+
+    // Per-service request arena: a ~1 MiB argument overflows the default 512 KiB
+    // request ring, but a function exposed with a larger arena accepts it.
+    let blob = vec![0xabu8; 1024 * 1024];
+
+    svc
+      .expose_function::<BlobReq, BlobResp, _>("blob.default", BLOB_REQ_SCHEMA, BLOB_RESP_SCHEMA, None, |req| {
+        BlobResp {
+          len: req.data.len() as i64,
+        }
+      })
+      .expect("expose blob.default");
+    let too_big = client.call_blocking::<BlobReq, BlobResp>(
+      "blob.default",
+      None,
+      &BlobReq { data: blob.clone() },
+      BLOB_REQ_SCHEMA,
+      BLOB_RESP_SCHEMA,
+      Duration::from_secs(5),
+    );
+    assert!(too_big.is_err(), "a 1 MiB arg must not fit the default request arena");
+
+    svc
+      .expose_function_with_arena::<BlobReq, BlobResp, _>(
+        "blob.big",
+        BLOB_REQ_SCHEMA,
+        BLOB_RESP_SCHEMA,
+        None,
+        4 * 1024 * 1024, // 4 MiB request arena
+        |req| BlobResp {
+          len: req.data.len() as i64,
+        },
+      )
+      .expect("expose blob.big");
+    let ok: BlobResp = client
+      .call_blocking(
+        "blob.big",
+        None,
+        &BlobReq { data: blob.clone() },
+        BLOB_REQ_SCHEMA,
+        BLOB_RESP_SCHEMA,
+        Duration::from_secs(5),
+      )
+      .expect("1 MiB arg fits a 4 MiB request arena");
+    assert_eq!(ok.len, blob.len() as i64);
   } // connections dropped here -> reply segments unlinked, threads joined
 
   // Regression: once the owner of "metrics"/"add" has left (unregistered above),

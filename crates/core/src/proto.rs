@@ -159,6 +159,12 @@ pub struct ExposeFunction {
   pub req_schema_json: String,
   pub resp_schema_json: String,
   pub access_key: String,
+  /// Requested request-arena capacity in bytes; `0` means the broker default.
+  ///
+  /// Added after v1; an older connector omits it and the broker fills `0` here
+  /// via `#[serde(default)]` (see [`legacy_schemas`]), i.e. keeps the default.
+  #[serde(default)]
+  pub req_arena_cap: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -287,7 +293,7 @@ fn schema_for(kind: Kind) -> &'static str {
     ),
     Kind::ExposeFunction => schema_json!(
       "ExposeFunction",
-      r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"fn_name","type":"string"},{"name":"req_schema_json","type":"string"},{"name":"resp_schema_json","type":"string"},{"name":"access_key","type":"string"}"#
+      r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"fn_name","type":"string"},{"name":"req_schema_json","type":"string"},{"name":"resp_schema_json","type":"string"},{"name":"access_key","type":"string"},{"name":"req_arena_cap","type":"long","default":0}"#
     ),
     Kind::ExposeReply => schema_json!(
       "ExposeReply",
@@ -324,14 +330,24 @@ fn schema_for(kind: Kind) -> &'static str {
 /// an older connector; fields added since are filled from the current struct's
 /// `#[serde(default)]`. This lets the broker be upgraded ahead of connectors.
 fn legacy_schemas() -> &'static [(Kind, &'static str)] {
-  &[(
-    // Register v1: before the `pid` field (owner-liveness reaping) was added.
-    Kind::Register,
-    schema_json!(
-      "Register",
-      r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+  &[
+    (
+      // Register v1: before the `pid` field (owner-liveness reaping) was added.
+      Kind::Register,
+      schema_json!(
+        "Register",
+        r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+      ),
     ),
-  )]
+    (
+      // ExposeFunction v1: before the per-service `req_arena_cap` field.
+      Kind::ExposeFunction,
+      schema_json!(
+        "ExposeFunction",
+        r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"fn_name","type":"string"},{"name":"req_schema_json","type":"string"},{"name":"resp_schema_json","type":"string"},{"name":"access_key","type":"string"}"#
+      ),
+    ),
+  ]
 }
 
 const ALL_KINDS: [Kind; 16] = [

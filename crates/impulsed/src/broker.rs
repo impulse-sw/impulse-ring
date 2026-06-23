@@ -378,7 +378,9 @@ impl Broker {
   }
 
   fn on_expose(&mut self, frame: &Frame) -> io::Result<()> {
-    let m: proto::ExposeFunction = proto::from_frame(Kind::ExposeFunction, frame)?;
+    // `from_frame_compat` lets a newer broker still decode an older connector's
+    // ExposeFunction (one without `req_arena_cap`), which serde defaults to 0.
+    let m: proto::ExposeFunction = proto::from_frame_compat(frame)?;
     if self.reg.function_name_taken(&m.fn_name) {
       // The name is taken — but if its owner has died (e.g. a previous instance
       // was SIGKILLed or crashed before it could unregister), reclaim it so this
@@ -415,7 +417,11 @@ impl Broker {
       }
     };
     let fn_id = self.reg.alloc_fn_id();
-    let req_arena = self.make_arena(util::function_arena(fn_id as u64), control::ARENA_CAP)?;
+    let arena_cap = control::clamp_arena_cap(m.req_arena_cap.max(0) as usize);
+    let req_arena = self.make_arena(util::function_arena(fn_id as u64), arena_cap)?;
+    if arena_cap != control::ARENA_CAP {
+      log::info!("function '{}' uses a {arena_cap}-byte request arena", m.fn_name);
+    }
     let key = (!m.access_key.is_empty()).then(|| util::key_hash(&m.access_key));
     self.reg.insert_function(FunctionMeta {
       id: fn_id,

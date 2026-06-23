@@ -11,7 +11,7 @@
 | `ChannelList` | `0xa1048915e5931da2` |
 | `Subscribe` | `0x8ebc74e247531cff` |
 | `SubscribeReply` | `0x83b6f56ef3d10c31` |
-| `ExposeFunction` | `0xa1acec8abc87f374` |
+| `ExposeFunction` | `0x642a6c8e5b677e6a` |
 | `ExposeReply` | `0x94bb3fe569f8abf8` |
 | `LookupFunction` | `0xe732b44c32d796fc` |
 | `LookupReply` | `0x5c9c6cbc1f3d26b2` |
@@ -28,3 +28,4 @@ serve not-yet-upgraded connectors.
 | Message | Legacy fingerprint | Superseded by |
 |---------|--------------------|---------------|
 | `Register` (pre-`pid`) | `0xfc723bd7afcffc02` | added `pid` (`long`, default `0`) |
+| `ExposeFunction` (pre-`req_arena_cap`) | `0xa1acec8abc87f374` | added `req_arena_cap` (`long`, default `0`) |

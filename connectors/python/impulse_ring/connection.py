@@ -229,8 +229,13 @@ class Connection:
         return Subscriber(Ring.attach(mm, 0), schema_fp)
 
     # ---- functions / RPC ----
-    def expose_function(self, name, req_schema_json, resp_schema_json, handler, key=None):
-        """`handler(req_body: bytes) -> resp_body: bytes` runs on a thread."""
+    def expose_function(self, name, req_schema_json, resp_schema_json, handler, key=None, req_arena_cap=0):
+        """`handler(req_body: bytes) -> resp_body: bytes` runs on a thread.
+
+        `req_arena_cap` requests a request-arena capacity in bytes (0 = broker
+        default). The broker clamps it to [256 KiB, 128 MiB] and rounds it up to
+        a power of two.
+        """
         corr = _new_id()
         e = avro.Encoder()
         e.put_long(corr)
@@ -239,6 +244,7 @@ class Connection:
         e.put_string(req_schema_json)
         e.put_string(resp_schema_json)
         e.put_string(key or "")
+        e.put_long(req_arena_cap)
         _, body = self._control_call(proto.FP_EXPOSE, e.getvalue(), corr, 5.0)
         d = avro.Decoder(body)
         d.get_long()

@@ -186,11 +186,15 @@ public:
     return Subscriber(s);
   }
 
+  // `req_arena_cap` requests a request-arena capacity in bytes (0 = broker
+  // default); the broker clamps it to [256 KiB, 128 MiB] and rounds up to a
+  // power of two.
   void expose_function(const std::string &name, const std::string &req_schema, const std::string &resp_schema,
-                       Handler handler, const std::string &key = "") {
+                       Handler handler, const std::string &key = "", std::uint64_t req_arena_cap = 0) {
     auto box = std::make_unique<Handler>(std::move(handler));
-    int rc = ir_expose_function(c_, name.c_str(), req_schema.c_str(), resp_schema.c_str(),
-                                key.empty() ? nullptr : key.c_str(), &Connection::trampoline, box.get());
+    int rc = ir_expose_function_with_arena(c_, name.c_str(), req_schema.c_str(), resp_schema.c_str(),
+                                           key.empty() ? nullptr : key.c_str(), req_arena_cap, &Connection::trampoline,
+                                           box.get());
     if (rc != IR_OK)
       throw Error(std::string("expose_function: ") + ir_last_error(c_));
     handlers_.push_back(std::move(box)); // keep the std::function alive for the service thread

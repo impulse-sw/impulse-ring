@@ -32,6 +32,9 @@ conn.ExposeFunction("add", reqSchema, respSchema, "", func(req []byte) ([]byte, 
 	o := ring.NewEncoder(); o.PutLong(d.Long() + d.Long())
 	return o.Bytes(), nil
 })
+// ...or size the request arena (bytes; 0 = broker default, clamped to
+// [256 KiB, 128 MiB] and rounded up to a power of two):
+conn.ExposeFunctionWithArena("upload", reqSchema, respSchema, "", 4*1024*1024, handler)
 
 // call (blocking)
 a := ring.NewEncoder(); a.PutLong(7); a.PutLong(35)

@@ -61,7 +61,7 @@
 #define FP_CHANNEL_LIST 0xa1048915e5931da2ull
 #define FP_SUBSCRIBE 0x8ebc74e247531cffull
 #define FP_SUBSCRIBE_REPLY 0x83b6f56ef3d10c31ull
-#define FP_EXPOSE 0xa1acec8abc87f374ull
+#define FP_EXPOSE 0x642a6c8e5b677e6aull
 #define FP_EXPOSE_REPLY 0x94bb3fe569f8abf8ull
 #define FP_LOOKUP 0xe732b44c32d796fcull
 #define FP_LOOKUP_REPLY 0x5c9c6cbc1f3d26b2ull
@@ -1261,6 +1261,12 @@ static void *service_main(void *arg) {
 
 int ir_expose_function(ir_conn *c, const char *name, const char *req_schema_json, const char *resp_schema_json,
                        const char *key, ir_handler handler, void *user) {
+  return ir_expose_function_with_arena(c, name, req_schema_json, resp_schema_json, key, 0, handler, user);
+}
+
+int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_schema_json,
+                                  const char *resp_schema_json, const char *key, uint64_t req_arena_cap,
+                                  ir_handler handler, void *user) {
   int64_t corr = rand_i64();
   ir_avro_w *w = ir_avro_w_new();
   ir_avro_put_long(w, corr);
@@ -1269,6 +1275,7 @@ int ir_expose_function(ir_conn *c, const char *name, const char *req_schema_json
   ir_avro_put_string(w, req_schema_json);
   ir_avro_put_string(w, resp_schema_json);
   ir_avro_put_string(w, key ? key : "");
+  ir_avro_put_long(w, (int64_t)req_arena_cap);
   size_t blen;
   const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;

@@ -186,12 +186,39 @@ impl Connection {
 
   /// Expose a function. `handler` runs on a dedicated service thread, decoding
   /// `Req` and encoding `Resp` with the supplied Avro schemas.
+  ///
+  /// The function's request arena uses the broker's default capacity; use
+  /// [`Connection::expose_function_with_arena`] to size it explicitly.
   pub fn expose_function<Req, Resp, F>(
     &self,
     name: &str,
     req_schema_json: &str,
     resp_schema_json: &str,
     key: Option<&str>,
+    handler: F,
+  ) -> io::Result<()>
+  where
+    Req: DeserializeOwned,
+    Resp: Serialize,
+    F: Fn(Req) -> Resp + Send + 'static,
+  {
+    self.expose_function_with_arena(name, req_schema_json, resp_schema_json, key, 0, handler)
+  }
+
+  /// Expose a function, requesting a request-arena capacity of `req_arena_cap`
+  /// bytes (`0` = broker default).
+  ///
+  /// The broker clamps the request to `[MIN_ARENA_CAP, MAX_ARENA_CAP]` and rounds
+  /// it up to a power of two (see `impulse_ring_core::control::clamp_arena_cap`).
+  /// A larger arena lets a high-throughput service buffer more in-flight requests
+  /// before producers hit backpressure.
+  pub fn expose_function_with_arena<Req, Resp, F>(
+    &self,
+    name: &str,
+    req_schema_json: &str,
+    resp_schema_json: &str,
+    key: Option<&str>,
+    req_arena_cap: usize,
     handler: F,
   ) -> io::Result<()>
   where
@@ -211,6 +238,7 @@ impl Connection {
         req_schema_json: req_schema_json.to_string(),
         resp_schema_json: resp_schema_json.to_string(),
         access_key: key.unwrap_or("").to_string(),
+        req_arena_cap: req_arena_cap as i64,
       },
     )?;
     let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;

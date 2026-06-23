@@ -226,6 +226,42 @@ pub const MAX_INLINE_RESPONSE_BODY: usize = 448 * 1024;
 /// fits the channel's data arena with room for framing.
 pub const RESPONSE_BODY_CHUNK: usize = 192 * 1024;
 
+/// Request header naming a channel that carries a **streamed request body**.
+///
+/// A unary RPC argument travels as a single record on the function's request
+/// ring, so a request body that would exceed that ring cannot be shipped inline
+/// (the connector reports `function request ring full`). When the client has such
+/// a body it publishes a Ring channel, streams the body onto it as
+/// [`RingStreamFrame`] [`opcode::DATA`] chunks terminated by [`opcode::CLOSE`],
+/// and sets this header on an otherwise normal [`RingHttpRequest`] (with an empty
+/// inline `body`). The listener subscribes to the named channel, reassembles the
+/// chunks into the full body and strips this header — so the chunking is
+/// transparent to the HTTP pipeline (and to the LBRP `impring://` connector,
+/// which just forwards the request as-is).
+///
+/// This is the request-side mirror of [`HEADER_BODY_CHANNEL`].
+pub const HEADER_REQUEST_BODY_CHANNEL: &str = "x-impulse-ring-req-body-chan";
+
+/// Largest request body the client ships inline through the function request ring.
+///
+/// Kept comfortably under `impulse_ring_core::control::ARENA_CAP` (256 KiB) — the
+/// capacity of a function's request ring — to leave room for the method, uri,
+/// headers and Avro/RPC framing in the same record. Bodies above this are streamed
+/// over a channel named by [`HEADER_REQUEST_BODY_CHANNEL`]. Mirrors
+/// [`MAX_INLINE_RESPONSE_BODY`] on the request side.
+pub const MAX_INLINE_REQUEST_BODY: usize = 192 * 1024;
+
+/// Chunk size used when streaming a large request body over a body channel.
+///
+/// Kept under `impulse_ring_core::control::ARENA_CAP` (256 KiB) so each frame fits
+/// the channel's data arena with room for framing. Mirrors [`RESPONSE_BODY_CHUNK`].
+pub const REQUEST_BODY_CHUNK: usize = 192 * 1024;
+
+// The inline ceiling and the streaming chunk must both fit a 256 KiB arena with
+// framing headroom (the smallest configurable request arena, `MIN_ARENA_CAP`).
+const _: () = assert!(MAX_INLINE_REQUEST_BODY <= 256 * 1024);
+const _: () = assert!(REQUEST_BODY_CHUNK <= 256 * 1024);
+
 /// Prefix for channels carrying HTTP-over-Ring stream data.
 pub const STREAM_CHAN_PREFIX: &str = "impulse-ring-http/v1/stream/";
 

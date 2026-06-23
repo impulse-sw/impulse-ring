@@ -39,7 +39,36 @@ pub const SUBMISSION_CAP: usize = 1 << 16;
 /// over a channel by the HTTP layer (`impulse-ring-http`).
 pub const REPLY_CAP: usize = 1 << 19;
 /// Default data-arena capacity for channels and function request rings.
-pub const ARENA_CAP: usize = 1 << 18;
+///
+/// 512 KiB by default, matching [`REPLY_CAP`]. A service may request a larger (or
+/// smaller) request arena per function when exposing it; the broker clamps the
+/// request with [`clamp_arena_cap`] to `[MIN_ARENA_CAP, MAX_ARENA_CAP]`.
+pub const ARENA_CAP: usize = 1 << 19;
+
+/// Smallest per-service request arena the broker will allocate.
+///
+/// Kept at 256 KiB so it always exceeds the HTTP layer's inline-request ceiling
+/// (`impulse_ring_http::MAX_INLINE_REQUEST_BODY`, 192 KiB) plus framing — i.e. an
+/// inline request body is safe even against the smallest configurable arena.
+pub const MIN_ARENA_CAP: usize = 1 << 18;
+/// Largest per-service request arena the broker will allocate.
+///
+/// 128 MiB. The ring header stores its capacity in a `u32`, and an oversized
+/// shared segment is RAM in `/dev/shm`, so this is a deliberately conservative
+/// ceiling on what one (mis)configured service can reserve.
+pub const MAX_ARENA_CAP: usize = 1 << 27;
+
+/// Resolve a requested arena capacity (in bytes) to a legal ring capacity.
+///
+/// `0` means "use the default" ([`ARENA_CAP`]). Any other value is clamped to
+/// `[MIN_ARENA_CAP, MAX_ARENA_CAP]` and rounded **up** to a power of two, because
+/// a ring's capacity must be a power of two ([`crate::ring::Ring::format`]).
+pub fn clamp_arena_cap(requested: usize) -> usize {
+  if requested == 0 {
+    return ARENA_CAP;
+  }
+  requested.clamp(MIN_ARENA_CAP, MAX_ARENA_CAP).next_power_of_two()
+}
 
 /// Total bytes required for the control segment.
 pub fn control_segment_bytes() -> usize {
@@ -73,4 +102,27 @@ pub fn attach_control(seg: Arc<Segment>) -> io::Result<Ring> {
 /// Read the broker PID recorded in the control superblock.
 pub fn broker_pid(seg: &Segment) -> i32 {
   unsafe { seg.atomic_u32_at(OFF_PID) }.load(Ordering::Relaxed) as i32
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn clamp_arena_cap_defaults_and_bounds() {
+    // 0 → default.
+    assert_eq!(clamp_arena_cap(0), ARENA_CAP);
+    // Below the floor is raised to the minimum.
+    assert_eq!(clamp_arena_cap(1), MIN_ARENA_CAP);
+    assert_eq!(clamp_arena_cap(MIN_ARENA_CAP - 1), MIN_ARENA_CAP);
+    // Above the ceiling is capped at the maximum.
+    assert_eq!(clamp_arena_cap(usize::MAX), MAX_ARENA_CAP);
+    // In-range non-power-of-two is rounded up, never past the ceiling.
+    assert_eq!(clamp_arena_cap(MIN_ARENA_CAP + 1), MIN_ARENA_CAP * 2);
+    assert!(clamp_arena_cap(MAX_ARENA_CAP - 1) <= MAX_ARENA_CAP);
+    // Every result is a legal ring capacity (power of two).
+    for req in [0, 1, 300 * 1024, 4 * 1024 * 1024, usize::MAX] {
+      assert!(clamp_arena_cap(req).is_power_of_two());
+    }
+  }
 }

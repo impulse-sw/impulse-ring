@@ -332,8 +332,16 @@ func (s *Subscriber) Recv(timeoutMs int) ([]byte, error) {
 // Close releases the subscriber's mapping.
 func (s *Subscriber) Close() { s.seg.close() }
 
-// ExposeFunction serves name with handler on a background goroutine.
+// ExposeFunction serves name with handler on a background goroutine, using the
+// broker's default request-arena size. See ExposeFunctionWithArena to size it.
 func (c *Connection) ExposeFunction(name, reqSchema, respSchema, key string, handler Handler) error {
+	return c.ExposeFunctionWithArena(name, reqSchema, respSchema, key, 0, handler)
+}
+
+// ExposeFunctionWithArena serves name with handler, requesting a request-arena
+// capacity of reqArenaCap bytes (0 = broker default). The broker clamps the
+// value to [256 KiB, 128 MiB] and rounds it up to a power of two.
+func (c *Connection) ExposeFunctionWithArena(name, reqSchema, respSchema, key string, reqArenaCap int64, handler Handler) error {
 	corr := randID()
 	e := NewEncoder()
 	e.PutLong(corr)
@@ -342,6 +350,7 @@ func (c *Connection) ExposeFunction(name, reqSchema, respSchema, key string, han
 	e.PutString(reqSchema)
 	e.PutString(respSchema)
 	e.PutString(key)
+	e.PutLong(reqArenaCap)
 	r, err := c.controlCall(fpExpose, e.Bytes(), corr, 5000)
 	if err != nil {
 		return err

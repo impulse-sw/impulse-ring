@@ -136,6 +136,58 @@ func TestSelfFlow(t *testing.T) {
 	svc.Close()
 }
 
+// TestPerServiceArena proves the optional request-arena sizing: a ~1 MiB
+// argument overflows the default request ring but fits a function exposed with
+// a larger arena via ExposeFunctionWithArena.
+func TestPerServiceArena(t *testing.T) {
+	const blobReqSchema = `{"type":"record","name":"BlobReq","namespace":"ring.examples","fields":[{"name":"data","type":"bytes"}]}`
+	const blobRespSchema = `{"type":"record","name":"BlobResp","namespace":"ring.examples","fields":[{"name":"len","type":"long"}]}`
+	blobHandler := func(req []byte) ([]byte, error) {
+		e := NewEncoder()
+		e.PutLong(int64(len(NewDecoder(req).Bytes())))
+		return e.Bytes(), nil
+	}
+
+	broker := startBroker(t)
+	defer func() {
+		broker.Process.Signal(os.Interrupt)
+		broker.Wait()
+	}()
+
+	svc, err := Connect("go-arena-svc")
+	if err != nil {
+		t.Fatalf("connect svc: %v", err)
+	}
+	defer svc.Close()
+	if err := svc.ExposeFunction("go-blob-default", blobReqSchema, blobRespSchema, "", blobHandler); err != nil {
+		t.Fatalf("expose default: %v", err)
+	}
+	if err := svc.ExposeFunctionWithArena("go-blob-big", blobReqSchema, blobRespSchema, "", 4*1024*1024, blobHandler); err != nil {
+		t.Fatalf("expose big: %v", err)
+	}
+
+	cli, err := Connect("go-arena-cli")
+	if err != nil {
+		t.Fatalf("connect cli: %v", err)
+	}
+	defer cli.Close()
+
+	be := NewEncoder()
+	be.PutBytes(make([]byte, 1024*1024)) // 1 MiB
+	arg := be.Bytes()
+
+	if _, err := cli.Call("go-blob-default", "", arg, 5000); err == nil {
+		t.Error("1 MiB arg must not fit the default request arena")
+	}
+	resp, err := cli.Call("go-blob-big", "", arg, 5000)
+	if err != nil {
+		t.Fatalf("call big: %v", err)
+	}
+	if got := NewDecoder(resp).Long(); got != 1024*1024 {
+		t.Errorf("echoed len = %d, want %d", got, 1024*1024)
+	}
+}
+
 // TestCrossLanguage subscribes to a channel published by the Rust peer and
 // calls a function it exposes, proving Go<->Rust Avro data-plane interop.
 func TestCrossLanguage(t *testing.T) {

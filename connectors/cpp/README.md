@@ -49,6 +49,9 @@ conn.expose_function("add", REQ, RESP, [](const uint8_t* req, size_t n) {
   ir::AvroWriter w; w.put_long(r.get_long() + r.get_long());
   return w.bytes();
 });
+// optional trailing arg sizes the request arena (bytes; 0 = broker default,
+// clamped to [256 KiB, 128 MiB] and rounded up to a power of two):
+conn.expose_function("upload", REQ, RESP, handler, "", 4 * 1024 * 1024);
 ir::AvroWriter args; args.put_long(7).put_long(35);
 ir::Bytes resp = conn.call("add", args.bytes());
 ```

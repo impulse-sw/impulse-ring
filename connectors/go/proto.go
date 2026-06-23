@@ -23,7 +23,7 @@ const (
 	fpChannelList   = 0xA1048915E5931DA2
 	fpSubscribe     = 0x8EBC74E247531CFF
 	fpSubscribeRply = 0x83B6F56EF3D10C31
-	fpExpose        = 0xA1ACEC8ABC87F374
+	fpExpose        = 0x642A6C8E5B677E6A
 	fpExposeReply   = 0x94BB3FE569F8ABF8
 	fpLookup        = 0xE732B44C32D796FC
 	fpLookupReply   = 0x5C9C6CBC1F3D26B2

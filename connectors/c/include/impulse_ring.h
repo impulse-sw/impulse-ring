@@ -87,9 +87,17 @@ uint64_t ir_subscriber_schema_fp(const ir_subscriber *s);
 
 /* ---- functions / RPC ---- */
 
-/* Expose a function served by `handler` on a background thread. */
+/* Expose a function served by `handler` on a background thread, using the
+ * broker's default request-arena size. */
 int ir_expose_function(ir_conn *c, const char *name, const char *req_schema_json, const char *resp_schema_json,
                        const char *key, ir_handler handler, void *user);
+
+/* As ir_expose_function, but requests a request-arena capacity of
+ * `req_arena_cap` bytes (0 = broker default). The broker clamps the value to
+ * [256 KiB, 128 MiB] and rounds it up to a power of two. */
+int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_schema_json,
+                                  const char *resp_schema_json, const char *key, uint64_t req_arena_cap,
+                                  ir_handler handler, void *user);
 
 /* Call a remote function and block for the response. On success returns IR_OK
  * with `*resp`/`*resp_len` set (owned by caller). */

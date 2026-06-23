@@ -24,3 +24,4 @@ log = { workspace = true, features = ["std"] }
 impulse-ring-connector.workspace = true
 impulse-ring-core.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true

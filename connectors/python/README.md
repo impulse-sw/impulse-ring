@@ -38,6 +38,9 @@ def add(req):
     out = avro.Encoder(); out.put_long(d.get_long() + d.get_long())
     return out.getvalue()
 conn.expose_function("add", REQ_SCHEMA, RESP_SCHEMA, add)
+# size the request arena (bytes; 0 = broker default, clamped to
+# [256 KiB, 128 MiB] and rounded up to a power of two):
+conn.expose_function("upload", REQ_SCHEMA, RESP_SCHEMA, add, req_arena_cap=4 * 1024 * 1024)
 
 # call (blocking) or call_async (returns a concurrent.futures.Future)
 e = avro.Encoder(); e.put_long(7); e.put_long(35)
