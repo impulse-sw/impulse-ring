@@ -2,7 +2,7 @@
 //! service loop that executes an exposed function and ships the Avro result back
 //! to the caller's reply segment.
 
-use crate::client::Slot;
+use crate::client::{RingCell, Slot};
 use apache_avro::Schema;
 use impulse_ring_core::avro;
 use impulse_ring_core::frame::Frame;
@@ -113,9 +113,13 @@ pub fn block_on<F: Future>(fut: F, timeout: Duration) -> Option<F::Output> {
 
 /// Run an exposed function: pop requests, decode args, execute the handler, and
 /// push the encoded response to each caller's reply segment.
+///
+/// The request ring is read through a [`RingCell`] so that a broker-restart
+/// reconnect (which re-exposes the function on a fresh arena) is picked up on the
+/// next poll without restarting this thread.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_service<Req, Resp, F>(
-  req_ring: Ring,
+  req_ring: RingCell,
   req_schema: Arc<Schema>,
   resp_schema: Arc<Schema>,
   req_fp: u64,
@@ -132,7 +136,8 @@ where
     // Cache opened caller reply segments so we don't reopen per call.
     let mut reply_rings: HashMap<String, Ring> = HashMap::new();
     while running.load(Ordering::Relaxed) {
-      let Some(bytes) = req_ring.pop_blocking(Some(Duration::from_millis(100))) else {
+      let ring = req_ring.read().unwrap().clone();
+      let Some(bytes) = ring.pop_blocking(Some(Duration::from_millis(100))) else {
         continue;
       };
       let frame = match Frame::decode(&bytes) {

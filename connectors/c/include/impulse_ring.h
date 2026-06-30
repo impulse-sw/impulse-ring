@@ -59,6 +59,21 @@ void ir_disconnect(ir_conn *c);
 /* Last human-readable error for the connection (never NULL). */
 const char *ir_last_error(ir_conn *c);
 
+/* ---- broker-restart recovery ---- */
+
+/* The broker epoch this connection is attached under. It changes whenever
+ * `impulsed` restarts; after a transparent reconnect it tracks the new broker. */
+int64_t ir_broker_epoch(const ir_conn *c);
+
+/* 1 if the live broker epoch differs from the one this connection attached under
+ * (i.e. impulsed restarted), or the broker is currently unreachable; else 0. */
+int ir_broker_restarted(const ir_conn *c);
+
+/* Enable (non-zero) or disable (0) transparent reconnect when a broker restart
+ * is detected. On by default: a connection re-registers and replays the channels
+ * it published and the functions it exposed, and retries the in-flight call. */
+void ir_set_auto_reconnect(ir_conn *c, int on);
+
 /* Release a buffer handed back by ir_recv / ir_call. */
 void ir_free(void *p);
 

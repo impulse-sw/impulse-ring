@@ -29,3 +29,8 @@ enable_testing()
 add_executable(ir_test_e2e tests/test_e2e.c)
 target_link_libraries(ir_test_e2e PRIVATE impulse_ring)
 add_test(NAME e2e COMMAND ir_test_e2e)
+
+# Broker-restart recovery test: it manages its own impulsed process, so it needs
+# the broker binary path in IMPULSED_BIN (default ./target/release/impulsed).
+add_executable(ir_test_restart tests/test_restart.c)
+target_link_libraries(ir_test_restart PRIVATE impulse_ring)

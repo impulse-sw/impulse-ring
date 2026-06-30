@@ -7,6 +7,10 @@ CONTROL_NAME = "/impulse-ring.ctl.v1"
 CTL_MAGIC = b"IMPRING\x00"
 SUBMISSION_BASE = 64
 REPLY_CAP = 1 << 16
+# Offset of the broker epoch (8 bytes) in the control superblock. It changes on
+# every broker run, so a different value on a freshly opened control segment
+# means impulsed restarted (see spec/bootstrap.md).
+CTL_OFF_EPOCH = 16
 
 # Control / RPC schema fingerprints (CRC-64-AVRO Rabin).
 FP_REGISTER = 0x879B416683EF2068

@@ -104,6 +104,17 @@ pub fn broker_pid(seg: &Segment) -> i32 {
   unsafe { seg.atomic_u32_at(OFF_PID) }.load(Ordering::Relaxed) as i32
 }
 
+/// Read the broker epoch recorded in the control superblock.
+///
+/// The epoch is the broker's start time in nanoseconds and is rewritten on every
+/// broker run (see [`format_control`]). A connector records the epoch it attached
+/// under; observing a *different* epoch on a freshly opened control segment is the
+/// socket-free signal that `impulsed` has restarted and the connection must be
+/// re-established (the old submission ring, reply segment and `client_id` are dead).
+pub fn broker_epoch(seg: &Segment) -> u64 {
+  unsafe { seg.atomic_u64_at(OFF_EPOCH) }.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

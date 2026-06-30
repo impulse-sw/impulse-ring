@@ -1,11 +1,15 @@
 //! Channel publish/subscribe handles over a data arena. The publisher is the
 //! sole producer and the subscriber the sole consumer of the arena's ring
 //! (Milestone 1: one subscriber per channel; fan-out is a later milestone).
+//!
+//! Both handles read their `Ring` through a [`RingCell`] so a broker-restart
+//! reconnect can rebind them to a fresh arena without invalidating the handle the
+//! caller is holding.
 
+use crate::client::{Inner, RingCell};
 use apache_avro::Schema;
 use impulse_ring_core::avro::{self, Fingerprint};
 use impulse_ring_core::frame::Frame;
-use impulse_ring_core::ring::Ring;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io;
@@ -14,17 +18,29 @@ use std::time::Duration;
 
 /// Producer end of a channel.
 pub struct Publisher {
-  ring: Ring,
+  ring: RingCell,
   schema: Arc<Schema>,
   schema_fp: Fingerprint,
+  // Held so the channel can be replayed onto a fresh broker after a restart, and
+  // deregistered when the publisher is dropped.
+  inner: Arc<Inner>,
+  reg_id: u64,
 }
 
 impl Publisher {
-  pub(crate) fn new(ring: Ring, schema: Arc<Schema>, schema_fp: Fingerprint) -> Self {
+  pub(crate) fn new(
+    ring: RingCell,
+    schema: Arc<Schema>,
+    schema_fp: Fingerprint,
+    inner: Arc<Inner>,
+    reg_id: u64,
+  ) -> Self {
     Publisher {
       ring,
       schema,
       schema_fp,
+      inner,
+      reg_id,
     }
   }
 
@@ -37,7 +53,8 @@ impl Publisher {
   pub fn publish<T: Serialize>(&self, msg: &T) -> io::Result<()> {
     let body = avro::encode(&self.schema, msg)?;
     let frame = Frame::new(self.schema_fp, body);
-    if !self.ring.push_blocking(&frame.encode(), Some(Duration::from_secs(1))) {
+    let ring = self.ring.read().unwrap().clone();
+    if !ring.push_blocking(&frame.encode(), Some(Duration::from_secs(1))) {
       return Err(io::Error::other("channel full (slow subscriber)"));
     }
     Ok(())
@@ -47,19 +64,26 @@ impl Publisher {
   pub fn try_publish<T: Serialize>(&self, msg: &T) -> io::Result<bool> {
     let body = avro::encode(&self.schema, msg)?;
     let frame = Frame::new(self.schema_fp, body);
-    Ok(self.ring.try_push(&frame.encode()))
+    let ring = self.ring.read().unwrap().clone();
+    Ok(ring.try_push(&frame.encode()))
+  }
+}
+
+impl Drop for Publisher {
+  fn drop(&mut self) {
+    self.inner.deregister(self.reg_id);
   }
 }
 
 /// Consumer end of a channel.
 pub struct Subscriber {
-  ring: Ring,
+  ring: RingCell,
   schema: Arc<Schema>,
   schema_fp: Fingerprint,
 }
 
 impl Subscriber {
-  pub(crate) fn new(ring: Ring, schema: Arc<Schema>, schema_fp: Fingerprint) -> Self {
+  pub(crate) fn new(ring: RingCell, schema: Arc<Schema>, schema_fp: Fingerprint) -> Self {
     Subscriber {
       ring,
       schema,
@@ -73,7 +97,8 @@ impl Subscriber {
 
   /// Receive the next message, waiting up to `timeout`. `Ok(None)` on timeout.
   pub fn recv<T: DeserializeOwned>(&self, timeout: Duration) -> io::Result<Option<T>> {
-    let Some(bytes) = self.ring.pop_blocking(Some(timeout)) else {
+    let ring = self.ring.read().unwrap().clone();
+    let Some(bytes) = ring.pop_blocking(Some(timeout)) else {
       return Ok(None);
     };
     let frame = Frame::decode(&bytes)?;

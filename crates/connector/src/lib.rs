@@ -11,6 +11,22 @@
 //! let chans = conn.list_channels().unwrap();
 //! # let _ = chans;
 //! ```
+//!
+//! ## Surviving a broker restart
+//!
+//! `impulsed` recreates its shared memory (with a fresh `epoch`) every time it
+//! starts, which invalidates an existing connection's submission ring, reply
+//! segment and `client_id`. A connection detects this — either proactively (a
+//! background watcher polls the control-segment epoch) or lazily (a control/RPC
+//! call that stops getting answered) — and **transparently reconnects**:
+//! re-attaches the control segment, re-registers under the same name, and
+//! **replays** the channels it had published and the functions it had exposed so
+//! live [`Publisher`]s and RPC services keep working. This is on by default; turn
+//! it off with [`Connection::set_auto_reconnect`].
+//!
+//! Subscribers are *not* auto-replayed (a channel's id changes across a restart
+//! and its publisher lives in another process); re-acquire a [`Subscriber`] after
+//! a restart by resolving the channel by name again.
 
 #![deny(warnings, clippy::todo, clippy::unimplemented)]
 
@@ -19,101 +35,36 @@ mod client;
 mod rpc;
 
 pub use channel::{Publisher, Subscriber};
+pub use client::live_broker_epoch;
 pub use rpc::{CallFuture, block_on};
 
-use client::{Inner, Slot};
+use client::{Inner, Reg, RingCell};
 use impulse_ring_core::avro::{self, Fingerprint};
-use impulse_ring_core::control;
-use impulse_ring_core::proto::{self, Kind, status};
-use impulse_ring_core::ring::{Ring, ring_bytes};
+use impulse_ring_core::proto::{self, Kind};
+use impulse_ring_core::ring::Ring;
 use impulse_ring_core::shm::Segment;
 use impulse_ring_core::util;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A live connection to the Ring broker.
 pub struct Connection {
   inner: Arc<Inner>,
-  running: Arc<AtomicBool>,
   threads: Mutex<Vec<JoinHandle<()>>>,
-  // Keep the bootstrap segments mapped (and the reply segment unlinked on drop).
-  _control_seg: Arc<Segment>,
-  _reply_seg: Arc<Segment>,
 }
 
 impl Connection {
   /// Connect to the broker and register `app_name` on the bus.
   pub fn connect(app_name: &str) -> io::Result<Connection> {
-    // 1. Attach the well-known control segment (socket-free rendezvous).
-    let control_seg = Arc::new(Segment::open(util::CONTROL_SEGMENT).map_err(|e| {
-      io::Error::new(
-        e.kind(),
-        format!("cannot open control segment (is impulsed running?): {e}"),
-      )
-    })?);
-    let submission = control::attach_control(control_seg.clone())?;
-
-    // 2. Create our own reply segment, named by a random bootstrap nonce.
-    let nonce = util::random_u64();
-    let reply_name = util::client_segment(nonce);
-    let reply_seg = Arc::new(Segment::create(&reply_name, ring_bytes(control::REPLY_CAP))?);
-    let reply_ring = Ring::format(reply_seg.clone(), 0, control::REPLY_CAP)?;
-
-    let inner = Arc::new(Inner {
-      submission,
-      pending: Mutex::new(HashMap::new()),
-      client_id: AtomicI64::new(0),
-      reply_segment: reply_name.clone(),
-    });
-    let running = Arc::new(AtomicBool::new(true));
-
-    // 3. Start the dispatcher that drains our reply ring.
-    let d_inner = inner.clone();
-    let d_run = running.clone();
-    let dispatcher = std::thread::spawn(move || client::run_dispatcher(d_inner, reply_ring, d_run));
-
-    let conn = Connection {
+    let (inner, threads) = Inner::connect(app_name)?;
+    Ok(Connection {
       inner,
-      running,
-      threads: Mutex::new(vec![dispatcher]),
-      _control_seg: control_seg,
-      _reply_seg: reply_seg,
-    };
-
-    // 4. Register and learn our client id.
-    let corr = util::random_u64() as i64;
-    let frame = proto::to_frame(
-      Kind::Register,
-      &proto::Register {
-        correlation_id: corr,
-        app_name: app_name.to_string(),
-        nonce: nonce as i64,
-        reply_segment: reply_name,
-        heartbeat_ms: 1000,
-        // Report our pid so the broker can reclaim our names if we die without
-        // unregistering (crash / SIGKILL) and later restart.
-        pid: std::process::id() as i64,
-      },
-    )?;
-    let reply = conn.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let rr: proto::RegisterReply = proto::from_frame(Kind::RegisterReply, &reply)?;
-    if rr.status != status::OK {
-      return Err(io::Error::other(format!("register rejected: {}", rr.message)));
-    }
-    conn.inner.client_id.store(rr.client_id, Ordering::Relaxed);
-    Ok(conn)
-  }
-
-  fn client_id(&self) -> i64 {
-    self.inner.client_id.load(Ordering::Relaxed)
+      threads: Mutex::new(threads),
+    })
   }
 
   fn next_corr() -> i64 {
@@ -123,65 +74,35 @@ impl Connection {
   /// Publish a channel with the given Avro schema. `key` gates subscribers.
   pub fn publish_channel(&self, name: &str, schema_json: &str, key: Option<&str>) -> io::Result<Publisher> {
     let (schema, _fp) = avro::parse(schema_json)?;
-    let corr = Self::next_corr();
-    let frame = proto::to_frame(
-      Kind::PublishChannel,
-      &proto::PublishChannel {
-        correlation_id: corr,
-        client_id: self.client_id(),
-        channel: name.to_string(),
-        schema_json: schema_json.to_string(),
-        access_key: key.unwrap_or("").to_string(),
-      },
-    )?;
-    let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let pr: proto::PublishReply = proto::from_frame(Kind::PublishReply, &reply)?;
-    if pr.status != status::OK {
-      return Err(io::Error::other(format!("publish failed: {}", pr.message)));
-    }
-    let arena = Arc::new(Segment::open(&pr.arena)?);
-    let ring = Ring::attach(arena, 0)?;
-    Ok(Publisher::new(ring, Arc::new(schema), proto::i64_to_fp(pr.schema_fp)))
+    let (ring, fp) = self
+      .inner
+      .with_reconnect(|| self.inner.do_publish(name, schema_json, key))?;
+    let cell: RingCell = Arc::new(RwLock::new(ring));
+    let id = self.inner.register_entry(Reg::Channel {
+      name: name.to_string(),
+      schema_json: schema_json.to_string(),
+      key: key.map(str::to_string),
+      ring: cell.clone(),
+    });
+    Ok(Publisher::new(cell, Arc::new(schema), fp, self.inner.clone(), id))
   }
 
   /// List all channels currently on the bus.
   pub fn list_channels(&self) -> io::Result<Vec<proto::ChannelInfo>> {
-    let corr = Self::next_corr();
-    let frame = proto::to_frame(
-      Kind::ListChannels,
-      &proto::ListChannels {
-        correlation_id: corr,
-        client_id: self.client_id(),
-      },
-    )?;
-    let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let list: proto::ChannelList = proto::from_frame(Kind::ChannelList, &reply)?;
-    Ok(list.channels)
+    self.inner.with_reconnect(|| self.inner.list_channels())
   }
 
   /// Subscribe to a channel by id. `expected_schema_json` is fingerprinted and
   /// checked against the publisher's schema by the broker.
+  ///
+  /// A subscriber is not auto-replayed across a broker restart (see the crate
+  /// docs); re-subscribe by resolving the channel by name again.
   pub fn subscribe(&self, channel_id: i64, key: Option<&str>, expected_schema_json: &str) -> io::Result<Subscriber> {
     let (schema, expected_fp) = avro::parse(expected_schema_json)?;
-    let corr = Self::next_corr();
-    let frame = proto::to_frame(
-      Kind::Subscribe,
-      &proto::Subscribe {
-        correlation_id: corr,
-        client_id: self.client_id(),
-        channel_id,
-        access_key: key.unwrap_or("").to_string(),
-        expected_fp: proto::fp_to_i64(expected_fp),
-      },
-    )?;
-    let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let sr: proto::SubscribeReply = proto::from_frame(Kind::SubscribeReply, &reply)?;
-    if sr.status != status::OK {
-      return Err(io::Error::other(format!("subscribe failed: {}", sr.message)));
-    }
-    let arena = Arc::new(Segment::open(&sr.arena)?);
-    let ring = Ring::attach(arena, 0)?;
-    Ok(Subscriber::new(ring, Arc::new(schema), proto::i64_to_fp(sr.schema_fp)))
+    let (ring, fp) = self
+      .inner
+      .with_reconnect(|| self.inner.do_subscribe(channel_id, key, expected_fp))?;
+    Ok(Subscriber::new(Arc::new(RwLock::new(ring)), Arc::new(schema), fp))
   }
 
   /// Expose a function. `handler` runs on a dedicated service thread, decoding
@@ -228,34 +149,31 @@ impl Connection {
   {
     let (req_schema, _req_fp) = avro::parse(req_schema_json)?;
     let (resp_schema, _resp_fp) = avro::parse(resp_schema_json)?;
-    let corr = Self::next_corr();
-    let frame = proto::to_frame(
-      Kind::ExposeFunction,
-      &proto::ExposeFunction {
-        correlation_id: corr,
-        client_id: self.client_id(),
-        fn_name: name.to_string(),
-        req_schema_json: req_schema_json.to_string(),
-        resp_schema_json: resp_schema_json.to_string(),
-        access_key: key.unwrap_or("").to_string(),
-        req_arena_cap: req_arena_cap as i64,
-      },
-    )?;
-    let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let er: proto::ExposeReply = proto::from_frame(Kind::ExposeReply, &reply)?;
-    if er.status != status::OK {
-      return Err(io::Error::other(format!("expose failed: {}", er.message)));
-    }
-    let arena = Arc::new(Segment::open(&er.req_arena)?);
-    let req_ring = Ring::attach(arena, 0)?;
+    let arena_cap = req_arena_cap as i64;
+    let (req_ring, req_fp, resp_fp) = self.inner.with_reconnect(|| {
+      self
+        .inner
+        .do_expose(name, req_schema_json, resp_schema_json, key, arena_cap)
+    })?;
+    let cell: RingCell = Arc::new(RwLock::new(req_ring));
+    // A function is owned for the connection's lifetime, so it has no caller
+    // handle to deregister it — it is replayed until the connection drops.
+    self.inner.register_entry(Reg::Function {
+      name: name.to_string(),
+      req_schema_json: req_schema_json.to_string(),
+      resp_schema_json: resp_schema_json.to_string(),
+      key: key.map(str::to_string),
+      arena_cap,
+      ring: cell.clone(),
+    });
     let handle = rpc::spawn_service::<Req, Resp, F>(
-      req_ring,
+      cell,
       Arc::new(req_schema),
       Arc::new(resp_schema),
-      proto::i64_to_fp(er.req_fp),
-      proto::i64_to_fp(er.resp_fp),
+      req_fp,
+      resp_fp,
       handler,
-      self.running.clone(),
+      self.inner.running(),
     );
     self.threads.lock().unwrap().push(handle);
     Ok(())
@@ -263,6 +181,10 @@ impl Connection {
 
   /// Call a remote function, returning a future for the response. Schema
   /// fingerprints are validated against the callee before sending.
+  ///
+  /// Note: the returned future is *not* auto-retried across a broker restart that
+  /// happens after the request was placed; use [`Connection::call_blocking`] (or
+  /// retry yourself) if you need that.
   pub fn call<Req, Resp>(
     &self,
     fn_name: &str,
@@ -279,21 +201,7 @@ impl Connection {
     let (resp_schema, expected_resp_fp) = avro::parse(resp_schema_json)?;
 
     // Look the function up and check interface compatibility.
-    let corr = Self::next_corr();
-    let frame = proto::to_frame(
-      Kind::LookupFunction,
-      &proto::LookupFunction {
-        correlation_id: corr,
-        client_id: self.client_id(),
-        fn_name: fn_name.to_string(),
-        access_key: key.unwrap_or("").to_string(),
-      },
-    )?;
-    let reply = self.inner.call_control(corr, frame, CONTROL_TIMEOUT)?;
-    let lr: proto::LookupReply = proto::from_frame(Kind::LookupReply, &reply)?;
-    if lr.status != status::OK {
-      return Err(io::Error::other(format!("lookup failed: {}", lr.message)));
-    }
+    let lr = self.inner.do_lookup(fn_name, key)?;
     if proto::i64_to_fp(lr.req_fp) != arg_fp {
       return Err(io::Error::other("call rejected: request schema mismatch"));
     }
@@ -307,11 +215,11 @@ impl Connection {
     let fn_ring = Ring::attach(fn_seg, 0)?;
 
     let rpc_corr = Self::next_corr();
-    let slot: Arc<Slot> = self.inner.register(rpc_corr);
+    let slot = self.inner.register(rpc_corr);
     let rpc_req = proto::RpcRequest {
       correlation_id: rpc_corr,
-      caller_id: self.client_id(),
-      reply_segment: self.inner.reply_segment.clone(),
+      caller_id: self.inner.client_id(),
+      reply_segment: self.inner.reply_segment(),
       arg_fp: proto::fp_to_i64(arg_fp),
       args,
     };
@@ -324,6 +232,9 @@ impl Connection {
   }
 
   /// Blocking convenience wrapper around [`Connection::call`].
+  ///
+  /// The whole lookup → send → await round-trip is retried once if `impulsed` is
+  /// restarted underneath it (when auto-reconnect is enabled).
   pub fn call_blocking<Req, Resp>(
     &self,
     fn_name: &str,
@@ -337,36 +248,43 @@ impl Connection {
     Req: Serialize,
     Resp: DeserializeOwned,
   {
-    let fut = self.call::<Req, Resp>(fn_name, key, req, req_schema_json, resp_schema_json)?;
-    match rpc::block_on(fut, timeout) {
-      Some(res) => res,
-      None => Err(io::Error::new(io::ErrorKind::TimedOut, "rpc call timed out")),
-    }
+    self.inner.with_reconnect(|| {
+      let fut = self.call::<Req, Resp>(fn_name, key, req, req_schema_json, resp_schema_json)?;
+      match rpc::block_on(fut, timeout) {
+        Some(res) => res,
+        None => Err(io::Error::new(io::ErrorKind::TimedOut, "rpc call timed out")),
+      }
+    })
   }
 
   /// Our broker-assigned client id (0 until registered).
   pub fn id(&self) -> Fingerprint {
-    self.client_id() as Fingerprint
+    self.inner.client_id() as Fingerprint
+  }
+
+  /// The broker epoch this connection is currently attached under. It changes
+  /// when `impulsed` restarts (and after a reconnect tracks the new broker).
+  pub fn broker_epoch(&self) -> u64 {
+    self.inner.epoch()
+  }
+
+  /// Enable or disable transparent reconnect on a detected broker restart
+  /// (default: enabled).
+  pub fn set_auto_reconnect(&self, on: bool) {
+    self.inner.set_auto_reconnect(on);
+  }
+
+  /// Whether transparent reconnect is enabled.
+  pub fn auto_reconnect(&self) -> bool {
+    self.inner.auto_reconnect()
   }
 }
 
 impl Drop for Connection {
   fn drop(&mut self) {
     // Best-effort unregister, then stop background threads.
-    let corr = Self::next_corr();
-    if let Ok(frame) = proto::to_frame(
-      Kind::Unregister,
-      &proto::Unregister {
-        correlation_id: corr,
-        client_id: self.client_id(),
-      },
-    ) {
-      let _ = self
-        .inner
-        .submission
-        .push_blocking(&frame.encode(), Some(Duration::from_millis(200)));
-    }
-    self.running.store(false, Ordering::Relaxed);
+    self.inner.send_unregister();
+    self.inner.running.store(false, std::sync::atomic::Ordering::Relaxed);
     for h in self.threads.lock().unwrap().drain(..) {
       let _ = h.join();
     }

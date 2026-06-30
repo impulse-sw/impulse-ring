@@ -9,6 +9,10 @@ const (
 	controlName    = "/impulse-ring.ctl.v1"
 	submissionBase = 64
 	replyCap       = 1 << 16
+	// ctlEpochOff is the offset of the broker epoch (8 bytes) in the control
+	// superblock. It changes on every broker run, so a different value on a
+	// freshly opened control segment means impulsed restarted (spec/bootstrap.md).
+	ctlEpochOff = 16
 )
 
 var ctlMagic = []byte("IMPRING\x00")

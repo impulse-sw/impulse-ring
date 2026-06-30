@@ -36,6 +36,9 @@ const lib = dlopen(LIB, {
   ir_recv: { args: [PTR, i32, PTR, PTR], returns: i32 },
   ir_subscriber_free: { args: [PTR], returns: VOID },
   ir_call: { args: [PTR, cstring, cstring, PTR, u64, i32, PTR, PTR], returns: i32 },
+  ir_broker_epoch: { args: [PTR], returns: i64 },
+  ir_broker_restarted: { args: [PTR], returns: i32 },
+  ir_set_auto_reconnect: { args: [PTR, i32], returns: VOID },
 });
 const S = lib.symbols;
 
@@ -166,5 +169,26 @@ export class Connection {
     const out = new Uint8Array(toArrayBuffer(p, 0, len)).slice();
     S.ir_free(p);
     return out;
+  }
+
+  // ---- broker-restart recovery ----
+  // The underlying C connection transparently reconnects and replays its
+  // published channels / exposed functions when impulsed restarts, so calls
+  // through this client keep working across a restart; these expose and control
+  // that behaviour.
+
+  // The broker epoch this connection is attached under (changes on a restart).
+  brokerEpoch(): bigint {
+    return BigInt(S.ir_broker_epoch(this.handle));
+  }
+
+  // True if impulsed has restarted (or is currently unreachable) since connect.
+  brokerRestarted(): boolean {
+    return S.ir_broker_restarted(this.handle) !== 0;
+  }
+
+  // Enable/disable transparent reconnect on a detected restart (default: on).
+  setAutoReconnect(on: boolean): void {
+    S.ir_set_auto_reconnect(this.handle, on ? 1 : 0);
   }
 }

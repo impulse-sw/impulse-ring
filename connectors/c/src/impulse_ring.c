@@ -34,6 +34,12 @@
 #define CONTROL_NAME "/impulse-ring.ctl.v1"
 #define SUBMISSION_BASE 64u
 #define REPLY_CAP (1u << 16)
+/* Control superblock: epoch (broker start nanos) at offset 16. It changes on
+ * every broker run, so a different value on a freshly opened control segment is
+ * the signal that impulsed restarted (see spec/bootstrap.md). */
+#define CTL_OFF_EPOCH 16u
+/* How often the watcher polls the control epoch for a restart (ms). */
+#define WATCH_INTERVAL_MS 250
 
 /* Ring header field offsets (relative to ring base). */
 #define R_MAGIC 0
@@ -388,6 +394,28 @@ static void seg_close(segment *s) {
   s->addr = NULL;
 }
 
+/* Read the broker epoch from a mapped control segment. */
+static int64_t ctl_epoch_of(const segment *ctl) {
+  int64_t epoch;
+  memcpy(&epoch, (const uint8_t *)ctl->addr + CTL_OFF_EPOCH, 8);
+  return epoch;
+}
+
+/* Open the control segment *freshly* and read the live broker epoch, validating
+ * the magic. Returns 0 on success (epoch in *out), -1 if the broker is currently
+ * unreachable (down / not yet up). The fresh open is essential: a connection's
+ * cached control mapping still points at the unlinked pre-restart segment. */
+static int live_broker_epoch(int64_t *out) {
+  segment ctl;
+  if (seg_open(CONTROL_NAME, &ctl) != 0)
+    return -1;
+  int ok = (memcmp(ctl.addr, "IMPRING\0", 8) == 0);
+  if (ok)
+    *out = ctl_epoch_of(&ctl);
+  seg_close(&ctl);
+  return ok ? 0 : -1;
+}
+
 /* ====================================================================== */
 /* Ring buffer                                                            */
 /* ====================================================================== */
@@ -626,12 +654,19 @@ typedef struct slot {
 
 typedef struct service {
   pthread_t thread;
+  pthread_mutex_t lock; /* guards arena/req_ring across a reconnect swap */
   ring req_ring;
   segment arena;
   uint64_t req_fp, resp_fp;
   ir_handler handler;
   void *user;
   volatile int *running;
+  /* Replay spec: re-expose this function on a fresh broker after a restart. */
+  char *name;
+  char *req_schema_json;
+  char *resp_schema_json;
+  char *key; /* NULL if none */
+  int64_t arena_cap;
   /* cache of opened caller reply segments */
   struct caller_seg *cache;
   struct service *next;
@@ -644,27 +679,58 @@ typedef struct caller_seg {
   struct caller_seg *next;
 } caller_seg;
 
+/* A published channel, tracked so it can be replayed (re-published, ring
+ * rebound) after a broker restart. The publisher handle reads `ring` through
+ * `lock`. */
+typedef struct chan_reg {
+  pthread_mutex_t lock; /* guards arena/ring across a reconnect swap */
+  char name[256];
+  char *schema_json;
+  char *key; /* NULL if none */
+  segment arena;
+  ring ring;
+  uint64_t schema_fp;
+  struct chan_reg *next;
+} chan_reg;
+
+/* A segment retired by a reconnect. We do not unmap arenas/reply segments at
+ * reconnect time because a background loop may have copied a ring into a local
+ * and still be reading it; we keep them mapped and free them at disconnect. */
+typedef struct retired_seg {
+  segment seg;
+  struct retired_seg *next;
+} retired_seg;
+
 struct ir_conn {
   char app_name[128];
+  /* Transport (current broker generation), guarded by tx_lock. */
+  pthread_mutex_t tx_lock;
   segment ctl;
   ring submission;
   segment reply;
   ring reply_ring;
   int64_t client_id;
+  int64_t nonce;
+  int64_t epoch;
   pthread_t dispatcher;
+  pthread_t watcher;
   volatile int running;
+  volatile int auto_reconnect;
+  volatile int in_reconnect; /* suppresses re-entrant reconnect during replay */
+  pthread_mutex_t reconnect_lock;
   pthread_mutex_t pend_lock;
   slot *pend;
-  pthread_mutex_t svc_lock;
+  pthread_mutex_t svc_lock; /* guards services + channels lists */
   service *services;
+  chan_reg *channels;
+  retired_seg *retired;
   pthread_mutex_t err_lock;
   char err[256];
 };
 
 struct ir_publisher {
-  segment arena;
-  ring ring;
-  uint64_t schema_fp;
+  ir_conn *c;
+  chan_reg *reg; /* owned by the connection's channel list */
 };
 struct ir_subscriber {
   segment arena;
@@ -692,13 +758,13 @@ void ir_free(void *p) {
 
 static int64_t rand_i64(void) {
   uint64_t v = 0;
-  int fd = open("/dev/urandom", O_RDONLY);
-  if (fd >= 0) {
-    ssize_t got = read(fd, &v, sizeof v);
-    close(fd);
-    if (got == (ssize_t)sizeof v)
-      return (int64_t)v;
-  }
+  /* Source randomness via the getrandom(2) syscall rather than opening and
+   * read()ing /dev/urandom: the latter is a blocking file read, and rand_i64 is
+   * called while the reconnect lock is held (correlation ids, reply nonce), which
+   * a static analyzer flags as a blocking call inside a critical section. */
+  long got = syscall(SYS_getrandom, &v, sizeof v, 0);
+  if (got == (long)sizeof v)
+    return (int64_t)v;
   /* fallback */
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -771,12 +837,26 @@ static int slot_wait(slot *s, int timeout_ms, uint64_t *fp, uint8_t **body, size
 }
 
 /* ---- dispatcher ---- */
+/* Push a framed control message onto the current submission ring (copied under
+ * tx_lock so a concurrent reconnect's swap is observed safely). */
+static int submit_frame(ir_conn *c, const uint8_t *frame, size_t flen, int timeout_ms) {
+  pthread_mutex_lock(&c->tx_lock);
+  ring sub = c->submission;
+  pthread_mutex_unlock(&c->tx_lock);
+  return ring_push(&sub, frame, flen, timeout_ms);
+}
+
 static void *dispatcher_main(void *arg) {
   ir_conn *c = (ir_conn *)arg;
   while (c->running) {
+    /* Re-read the reply ring each tick so a reconnect's swap is picked up. The
+     * old reply segment is retired (kept mapped), so this copy stays valid. */
+    pthread_mutex_lock(&c->tx_lock);
+    ring reply_ring = c->reply_ring;
+    pthread_mutex_unlock(&c->tx_lock);
     uint8_t *rec = NULL;
     size_t n = 0;
-    if (!ring_pop_blocking(&c->reply_ring, 100, &rec, &n))
+    if (!ring_pop_blocking(&reply_ring, 100, &rec, &n))
       continue;
     uint64_t fp;
     const uint8_t *body;
@@ -815,7 +895,7 @@ static int control_call(ir_conn *c, uint64_t fp, const uint8_t *body, size_t bod
     slot_free(s);
     return IR_ERR;
   }
-  int rc = ring_push(&c->submission, frame, flen, 2000);
+  int rc = submit_frame(c, frame, flen, 2000);
   free(frame);
   if (rc != 0) {
     slot_take(c, corr);
@@ -830,51 +910,129 @@ static int control_call(ir_conn *c, uint64_t fp, const uint8_t *body, size_t bod
 }
 
 /* ====================================================================== */
-/* Public API                                                             */
+/* Broker-restart reconnect                                               */
 /* ====================================================================== */
 
-ir_conn *ir_connect(const char *app_name) {
-  ir_conn *c = (ir_conn *)calloc(1, sizeof(*c));
-  if (!c)
-    return NULL;
-  snprintf(c->app_name, sizeof c->app_name, "%s", app_name ? app_name : "");
-  pthread_mutex_init(&c->pend_lock, NULL);
-  pthread_mutex_init(&c->svc_lock, NULL);
-  pthread_mutex_init(&c->err_lock, NULL);
-  c->running = 1;
+/* Forward decls for the reconnect/replay machinery. */
+static int do_register(ir_conn *c);
+static void replay_registrations(ir_conn *c);
 
-  if (seg_open(CONTROL_NAME, &c->ctl) != 0) {
-    set_err(c, "cannot open control segment (is impulsed running?)");
-    goto fail;
+/* Open a fresh control segment + a new reply segment and install them as the
+ * connection's transport (client_id reset to 0, to be set by do_register). The
+ * previous control/reply segments are retired (kept mapped) so background loops
+ * that copied a ring out of them stay valid until disconnect. Caller must hold
+ * reconnect_lock. */
+static int bootstrap_transport(ir_conn *c) {
+  segment ctl;
+  if (seg_open(CONTROL_NAME, &ctl) != 0)
+    return IR_ERR_NOBROKER;
+  if (memcmp(ctl.addr, "IMPRING\0", 8) != 0) {
+    seg_close(&ctl);
+    return IR_ERR_NOBROKER;
   }
-  /* validate control magic "IMPRING\0" */
-  uint64_t ctl_magic;
-  memcpy(&ctl_magic, c->ctl.addr, 8);
-  if (memcmp(c->ctl.addr, "IMPRING\0", 8) != 0) {
-    set_err(c, "control magic mismatch");
-    goto fail;
+  ring submission;
+  if (ring_attach(&submission, (uint8_t *)ctl.addr + SUBMISSION_BASE) != 0) {
+    seg_close(&ctl);
+    return IR_ERR;
   }
-  if (ring_attach(&c->submission, (uint8_t *)c->ctl.addr + SUBMISSION_BASE) != 0) {
-    set_err(c, "cannot attach submission ring");
-    goto fail;
-  }
+  int64_t epoch = ctl_epoch_of(&ctl);
 
-  /* create our reply segment, named by a random nonce */
   int64_t nonce = rand_i64();
   char reply_name[256];
   snprintf(reply_name, sizeof reply_name, "/impulse-ring.cli.%llu.v1", (unsigned long long)(uint64_t)nonce);
-  if (seg_create(reply_name, RING_HEADER + REPLY_CAP, &c->reply) != 0) {
-    set_err(c, "cannot create reply segment");
-    goto fail;
+  segment reply;
+  if (seg_create(reply_name, RING_HEADER + REPLY_CAP, &reply) != 0) {
+    seg_close(&ctl);
+    return IR_ERR;
   }
-  ring_format(&c->reply_ring, (uint8_t *)c->reply.addr, REPLY_CAP);
+  ring reply_ring;
+  ring_format(&reply_ring, (uint8_t *)reply.addr, REPLY_CAP);
 
-  if (pthread_create(&c->dispatcher, NULL, dispatcher_main, c) != 0) {
-    set_err(c, "cannot start dispatcher");
-    goto fail;
+  pthread_mutex_lock(&c->tx_lock);
+  /* Retire the old segments (still mapped) rather than unmapping them now. */
+  if (c->ctl.addr) {
+    retired_seg *r1 = (retired_seg *)calloc(1, sizeof(*r1));
+    r1->seg = c->ctl;
+    r1->next = c->retired;
+    c->retired = r1;
   }
+  if (c->reply.addr) {
+    retired_seg *r2 = (retired_seg *)calloc(1, sizeof(*r2));
+    r2->seg = c->reply;
+    r2->next = c->retired;
+    c->retired = r2;
+  }
+  c->ctl = ctl;
+  c->submission = submission;
+  c->reply = reply;
+  c->reply_ring = reply_ring;
+  c->nonce = nonce;
+  c->epoch = epoch;
+  c->client_id = 0;
+  pthread_mutex_unlock(&c->tx_lock);
+  return IR_OK;
+}
 
-  /* Register */
+/* Re-bootstrap onto a restarted broker and replay every owned channel/function.
+ * Single-flight: if another thread already advanced past `observed_epoch`, this
+ * returns success without doing anything. */
+static int try_reconnect(ir_conn *c, int64_t observed_epoch) {
+  pthread_mutex_lock(&c->reconnect_lock);
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t cur = c->epoch;
+  pthread_mutex_unlock(&c->tx_lock);
+  if (cur != observed_epoch) {
+    pthread_mutex_unlock(&c->reconnect_lock);
+    return IR_OK; /* someone else reconnected */
+  }
+  c->in_reconnect = 1;
+  int rc = bootstrap_transport(c);
+  if (rc == IR_OK) {
+    /* Detach pending slots bound to the dead broker: they will never be answered
+     * by the new broker (new correlation ids), so let their waiters time out and
+     * free their own slots rather than delivering a bogus reply here. */
+    pthread_mutex_lock(&c->pend_lock);
+    c->pend = NULL;
+    pthread_mutex_unlock(&c->pend_lock);
+    rc = do_register(c);
+    if (rc == IR_OK)
+      replay_registrations(c);
+  }
+  c->in_reconnect = 0;
+  pthread_mutex_unlock(&c->reconnect_lock);
+  return rc;
+}
+
+/* If `rc` indicates the broker stopped answering and the live epoch has actually
+ * changed, reconnect. Returns 1 if a reconnect happened (caller should rebuild
+ * its request and retry once), 0 otherwise. */
+static int reconnect_if_restarted(ir_conn *c, int rc) {
+  if (!c->auto_reconnect || c->in_reconnect)
+    return 0;
+  if (rc != IR_ERR_TIMEOUT && rc != IR_ERR_NOBROKER)
+    return 0;
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t observed = c->epoch;
+  pthread_mutex_unlock(&c->tx_lock);
+  int64_t live;
+  if (live_broker_epoch(&live) != 0 || live == observed)
+    return 0;
+  return try_reconnect(c, observed) == IR_OK ? 1 : 0;
+}
+
+/* ====================================================================== */
+/* Public API                                                             */
+/* ====================================================================== */
+
+/* Send the Register record using the current transport and adopt the new
+ * client_id. Used by the initial connect and every reconnect. */
+static int do_register(ir_conn *c) {
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t nonce = c->nonce;
+  char reply_name[256];
+  snprintf(reply_name, sizeof reply_name, "%s", c->reply.name);
+  pthread_mutex_unlock(&c->tx_lock);
+
   int64_t corr = rand_i64();
   ir_avro_w *w = ir_avro_w_new();
   ir_avro_put_long(w, corr);
@@ -890,13 +1048,11 @@ ir_conn *ir_connect(const char *app_name) {
   size_t rlen;
   int rc = control_call(c, FP_REGISTER, body, blen, corr, 5000, &rfp, &rbody, &rlen);
   ir_avro_w_free(w);
-  if (rc != 0) {
-    set_err(c, "register timed out");
-    goto fail;
-  }
+  if (rc != 0)
+    return rc;
   /* RegisterReply: correlation_id, client_id, status, message */
   ir_avro_r *r = ir_avro_r_new(rbody, rlen);
-  (void)ir_avro_get_long(r); /* corr */
+  (void)ir_avro_get_long(r);
   int64_t client_id = ir_avro_get_long(r);
   int32_t status = ir_avro_get_int(r);
   char *msg = ir_avro_get_string(r);
@@ -905,30 +1061,222 @@ ir_conn *ir_connect(const char *app_name) {
   if (status != ST_OK) {
     set_err(c, "register rejected: %s", msg ? msg : "");
     free(msg);
-    goto fail;
+    return IR_ERR;
   }
   free(msg);
+  pthread_mutex_lock(&c->tx_lock);
   c->client_id = client_id;
+  pthread_mutex_unlock(&c->tx_lock);
+  return IR_OK;
+}
+
+/* Append `old` to the retired-segment list (kept mapped until disconnect). */
+static void retire_segment(ir_conn *c, segment old) {
+  if (!old.addr)
+    return;
+  retired_seg *r = (retired_seg *)calloc(1, sizeof(*r));
+  r->seg = old;
+  pthread_mutex_lock(&c->tx_lock);
+  r->next = c->retired;
+  c->retired = r;
+  pthread_mutex_unlock(&c->tx_lock);
+}
+
+/* Re-publish a tracked channel onto the fresh broker and rebind its ring. */
+static void republish_channel(ir_conn *c, chan_reg *cr) {
+  int64_t corr = rand_i64();
+  ir_avro_w *w = ir_avro_w_new();
+  ir_avro_put_long(w, corr);
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t cid = c->client_id;
+  pthread_mutex_unlock(&c->tx_lock);
+  ir_avro_put_long(w, cid);
+  ir_avro_put_string(w, cr->name);
+  ir_avro_put_string(w, cr->schema_json);
+  ir_avro_put_string(w, cr->key ? cr->key : "");
+  size_t blen;
+  const uint8_t *body = ir_avro_w_bytes(w, &blen);
+  uint64_t rfp;
+  uint8_t *rbody;
+  size_t rlen;
+  int rc = control_call(c, FP_PUBLISH, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+  ir_avro_w_free(w);
+  if (rc != 0)
+    return;
+  ir_avro_r *r = ir_avro_r_new(rbody, rlen);
+  (void)ir_avro_get_long(r);
+  (void)ir_avro_get_long(r); /* channel_id */
+  int64_t schema_fp = ir_avro_get_long(r);
+  char *arena = ir_avro_get_string(r);
+  int32_t status = ir_avro_get_int(r);
+  (void)ir_avro_get_string(r);
+  ir_avro_r_free(r);
+  free(rbody);
+  if (status != ST_OK) {
+    free(arena);
+    return;
+  }
+  segment newseg;
+  ring newring;
+  if (seg_open(arena, &newseg) == 0 && ring_attach(&newring, (uint8_t *)newseg.addr) == 0) {
+    pthread_mutex_lock(&cr->lock);
+    segment oldseg = cr->arena;
+    cr->arena = newseg;
+    cr->ring = newring;
+    cr->schema_fp = (uint64_t)schema_fp;
+    pthread_mutex_unlock(&cr->lock);
+    retire_segment(c, oldseg);
+  } else if (newseg.addr) {
+    seg_close(&newseg);
+  }
+  free(arena);
+}
+
+/* Re-expose a service's function onto the fresh broker and rebind its ring. */
+static void reexpose_function(ir_conn *c, service *sv) {
+  int64_t corr = rand_i64();
+  ir_avro_w *w = ir_avro_w_new();
+  ir_avro_put_long(w, corr);
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t cid = c->client_id;
+  pthread_mutex_unlock(&c->tx_lock);
+  ir_avro_put_long(w, cid);
+  ir_avro_put_string(w, sv->name);
+  ir_avro_put_string(w, sv->req_schema_json);
+  ir_avro_put_string(w, sv->resp_schema_json);
+  ir_avro_put_string(w, sv->key ? sv->key : "");
+  ir_avro_put_long(w, sv->arena_cap);
+  size_t blen;
+  const uint8_t *body = ir_avro_w_bytes(w, &blen);
+  uint64_t rfp;
+  uint8_t *rbody;
+  size_t rlen;
+  int rc = control_call(c, FP_EXPOSE, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+  ir_avro_w_free(w);
+  if (rc != 0)
+    return;
+  ir_avro_r *r = ir_avro_r_new(rbody, rlen);
+  (void)ir_avro_get_long(r);
+  (void)ir_avro_get_long(r); /* fn_id */
+  int64_t req_fp = ir_avro_get_long(r);
+  int64_t resp_fp = ir_avro_get_long(r);
+  char *req_arena = ir_avro_get_string(r);
+  int32_t status = ir_avro_get_int(r);
+  (void)ir_avro_get_string(r);
+  ir_avro_r_free(r);
+  free(rbody);
+  if (status != ST_OK) {
+    free(req_arena);
+    return;
+  }
+  segment newseg;
+  ring newring;
+  if (seg_open(req_arena, &newseg) == 0 && ring_attach(&newring, (uint8_t *)newseg.addr) == 0) {
+    pthread_mutex_lock(&sv->lock);
+    segment oldseg = sv->arena;
+    sv->arena = newseg;
+    sv->req_ring = newring;
+    sv->req_fp = (uint64_t)req_fp;
+    sv->resp_fp = (uint64_t)resp_fp;
+    pthread_mutex_unlock(&sv->lock);
+    retire_segment(c, oldseg);
+  } else if (newseg.addr) {
+    seg_close(&newseg);
+  }
+  free(req_arena);
+}
+
+/* Replay every owned channel and function onto the (reconnected) broker. */
+static void replay_registrations(ir_conn *c) {
+  pthread_mutex_lock(&c->svc_lock);
+  for (chan_reg *cr = c->channels; cr; cr = cr->next)
+    republish_channel(c, cr);
+  for (service *sv = c->services; sv; sv = sv->next)
+    reexpose_function(c, sv);
+  pthread_mutex_unlock(&c->svc_lock);
+}
+
+/* Background watcher: proactively detect a broker restart (so an idle connection
+ * — notably a pure RPC server — recovers without a failed call to trigger it). */
+static void *watcher_main(void *arg) {
+  ir_conn *c = (ir_conn *)arg;
+  while (c->running) {
+    for (int i = 0; i < WATCH_INTERVAL_MS / 10 && c->running; i++)
+      usleep(10000);
+    if (!c->running || !c->auto_reconnect)
+      continue;
+    pthread_mutex_lock(&c->tx_lock);
+    int64_t observed = c->epoch;
+    pthread_mutex_unlock(&c->tx_lock);
+    int64_t live;
+    if (live_broker_epoch(&live) == 0 && live != observed)
+      try_reconnect(c, observed);
+  }
+  return NULL;
+}
+
+ir_conn *ir_connect(const char *app_name) {
+  ir_conn *c = (ir_conn *)calloc(1, sizeof(*c));
+  if (!c)
+    return NULL;
+  snprintf(c->app_name, sizeof c->app_name, "%s", app_name ? app_name : "");
+  pthread_mutex_init(&c->tx_lock, NULL);
+  pthread_mutex_init(&c->reconnect_lock, NULL);
+  pthread_mutex_init(&c->pend_lock, NULL);
+  pthread_mutex_init(&c->svc_lock, NULL);
+  pthread_mutex_init(&c->err_lock, NULL);
+  c->running = 1;
+  c->auto_reconnect = 1;
+
+  if (bootstrap_transport(c) != IR_OK) {
+    set_err(c, "cannot open control segment (is impulsed running?)");
+    goto fail;
+  }
+
+  if (pthread_create(&c->dispatcher, NULL, dispatcher_main, c) != 0) {
+    set_err(c, "cannot start dispatcher");
+    goto fail;
+  }
+  if (pthread_create(&c->watcher, NULL, watcher_main, c) != 0) {
+    set_err(c, "cannot start watcher");
+    c->running = 0;
+    pthread_join(c->dispatcher, NULL);
+    goto fail;
+  }
+
+  if (do_register(c) != IR_OK) {
+    set_err(c, "register failed");
+    c->running = 0;
+    pthread_join(c->dispatcher, NULL);
+    pthread_join(c->watcher, NULL);
+    goto fail;
+  }
   return c;
 
-fail:
-  /* tear down whatever started */
-  c->running = 0;
-  if (c->dispatcher)
-    pthread_join(c->dispatcher, NULL);
+fail: {
+  /* keep error retrievable: print and free */
+  char tmp[256];
+  snprintf(tmp, sizeof tmp, "%s", c->err);
+  fprintf(stderr, "ir_connect: %s\n", tmp);
+}
   seg_close(&c->reply);
   seg_close(&c->ctl);
-  {
-    /* keep error retrievable: return NULL but free */
-    char tmp[256];
-    snprintf(tmp, sizeof tmp, "%s", c->err);
-    fprintf(stderr, "ir_connect: %s\n", tmp);
-  }
+  pthread_mutex_destroy(&c->tx_lock);
+  pthread_mutex_destroy(&c->reconnect_lock);
   pthread_mutex_destroy(&c->pend_lock);
   pthread_mutex_destroy(&c->svc_lock);
   pthread_mutex_destroy(&c->err_lock);
   free(c);
   return NULL;
+}
+
+/* Read the current broker-assigned client id under tx_lock (it changes on a
+ * reconnect). */
+static int64_t client_id_of(ir_conn *c) {
+  pthread_mutex_lock(&c->tx_lock);
+  int64_t id = c->client_id;
+  pthread_mutex_unlock(&c->tx_lock);
+  return id;
 }
 
 void ir_disconnect(ir_conn *c) {
@@ -938,19 +1286,20 @@ void ir_disconnect(ir_conn *c) {
   int64_t corr = rand_i64();
   ir_avro_w *w = ir_avro_w_new();
   ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
+  ir_avro_put_long(w, client_id_of(c));
   size_t blen;
   const uint8_t *body = ir_avro_w_bytes(w, &blen);
   size_t flen;
   uint8_t *frame = frame_encode(FP_UNREGISTER, body, blen, &flen);
   if (frame) {
-    ring_push(&c->submission, frame, flen, 200);
+    submit_frame(c, frame, flen, 200);
     free(frame);
   }
   ir_avro_w_free(w);
 
   c->running = 0;
   pthread_join(c->dispatcher, NULL);
+  pthread_join(c->watcher, NULL);
 
   /* stop + join services */
   pthread_mutex_lock(&c->svc_lock);
@@ -966,9 +1315,36 @@ void ir_disconnect(ir_conn *c) {
       cs = nx;
     }
     seg_close(&sv->arena);
+    pthread_mutex_destroy(&sv->lock);
+    free(sv->name);
+    free(sv->req_schema_json);
+    free(sv->resp_schema_json);
+    free(sv->key);
     service *nx = sv->next;
     free(sv);
     sv = nx;
+  }
+
+  /* free tracked channels (publishers should already be freed by the caller, but
+   * reclaim any arena still mapped) */
+  chan_reg *cr = c->channels;
+  while (cr) {
+    chan_reg *nx = cr->next;
+    seg_close(&cr->arena);
+    pthread_mutex_destroy(&cr->lock);
+    free(cr->schema_json);
+    free(cr->key);
+    free(cr);
+    cr = nx;
+  }
+
+  /* free segments retired by reconnects */
+  retired_seg *rs = c->retired;
+  while (rs) {
+    retired_seg *nx = rs->next;
+    seg_close(&rs->seg);
+    free(rs);
+    rs = nx;
   }
 
   /* free any leftover pending slots */
@@ -981,6 +1357,8 @@ void ir_disconnect(ir_conn *c) {
 
   seg_close(&c->reply);
   seg_close(&c->ctl);
+  pthread_mutex_destroy(&c->tx_lock);
+  pthread_mutex_destroy(&c->reconnect_lock);
   pthread_mutex_destroy(&c->pend_lock);
   pthread_mutex_destroy(&c->svc_lock);
   pthread_mutex_destroy(&c->err_lock);
@@ -988,59 +1366,82 @@ void ir_disconnect(ir_conn *c) {
 }
 
 ir_publisher *ir_publish_channel(ir_conn *c, const char *name, const char *schema_json, const char *key) {
-  int64_t corr = rand_i64();
-  ir_avro_w *w = ir_avro_w_new();
-  ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
-  ir_avro_put_string(w, name);
-  ir_avro_put_string(w, schema_json);
-  ir_avro_put_string(w, key ? key : "");
-  size_t blen;
-  const uint8_t *body = ir_avro_w_bytes(w, &blen);
-  uint64_t rfp;
-  uint8_t *rbody;
-  size_t rlen;
-  int rc = control_call(c, FP_PUBLISH, body, blen, corr, 5000, &rfp, &rbody, &rlen);
-  ir_avro_w_free(w);
-  if (rc != 0) {
-    set_err(c, "publish timed out");
-    return NULL;
-  }
-  /* PublishReply: corr, channel_id, schema_fp, arena, status, message */
-  ir_avro_r *r = ir_avro_r_new(rbody, rlen);
-  (void)ir_avro_get_long(r);
-  (void)ir_avro_get_long(r); /* channel_id */
-  int64_t schema_fp = ir_avro_get_long(r);
-  char *arena = ir_avro_get_string(r);
-  int32_t status = ir_avro_get_int(r);
-  char *msg = ir_avro_get_string(r);
-  ir_avro_r_free(r);
-  free(rbody);
-  if (status != ST_OK) {
-    set_err(c, "publish failed: %s", msg ? msg : "");
-    free(arena);
+  for (int attempt = 0;; attempt++) {
+    int64_t corr = rand_i64();
+    ir_avro_w *w = ir_avro_w_new();
+    ir_avro_put_long(w, corr);
+    ir_avro_put_long(w, client_id_of(c));
+    ir_avro_put_string(w, name);
+    ir_avro_put_string(w, schema_json);
+    ir_avro_put_string(w, key ? key : "");
+    size_t blen;
+    const uint8_t *body = ir_avro_w_bytes(w, &blen);
+    uint64_t rfp;
+    uint8_t *rbody;
+    size_t rlen;
+    int rc = control_call(c, FP_PUBLISH, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+    ir_avro_w_free(w);
+    if (rc != 0) {
+      if (attempt == 0 && reconnect_if_restarted(c, rc))
+        continue;
+      set_err(c, "publish timed out");
+      return NULL;
+    }
+    /* PublishReply: corr, channel_id, schema_fp, arena, status, message */
+    ir_avro_r *r = ir_avro_r_new(rbody, rlen);
+    (void)ir_avro_get_long(r);
+    (void)ir_avro_get_long(r); /* channel_id */
+    int64_t schema_fp = ir_avro_get_long(r);
+    char *arena = ir_avro_get_string(r);
+    int32_t status = ir_avro_get_int(r);
+    char *msg = ir_avro_get_string(r);
+    ir_avro_r_free(r);
+    free(rbody);
+    if (status != ST_OK) {
+      set_err(c, "publish failed: %s", msg ? msg : "");
+      free(arena);
+      free(msg);
+      return NULL;
+    }
     free(msg);
-    return NULL;
-  }
-  free(msg);
-  ir_publisher *p = (ir_publisher *)calloc(1, sizeof(*p));
-  if (seg_open(arena, &p->arena) != 0 || ring_attach(&p->ring, (uint8_t *)p->arena.addr) != 0) {
-    set_err(c, "cannot map channel arena");
+    chan_reg *cr = (chan_reg *)calloc(1, sizeof(*cr));
+    pthread_mutex_init(&cr->lock, NULL);
+    snprintf(cr->name, sizeof cr->name, "%s", name);
+    cr->schema_json = strdup(schema_json);
+    cr->key = key ? strdup(key) : NULL;
+    cr->schema_fp = (uint64_t)schema_fp;
+    if (seg_open(arena, &cr->arena) != 0 || ring_attach(&cr->ring, (uint8_t *)cr->arena.addr) != 0) {
+      set_err(c, "cannot map channel arena");
+      free(arena);
+      pthread_mutex_destroy(&cr->lock);
+      free(cr->schema_json);
+      free(cr->key);
+      free(cr);
+      return NULL;
+    }
     free(arena);
-    free(p);
-    return NULL;
+    pthread_mutex_lock(&c->svc_lock);
+    cr->next = c->channels;
+    c->channels = cr;
+    pthread_mutex_unlock(&c->svc_lock);
+    ir_publisher *p = (ir_publisher *)calloc(1, sizeof(*p));
+    p->c = c;
+    p->reg = cr;
+    return p;
   }
-  free(arena);
-  p->schema_fp = (uint64_t)schema_fp;
-  return p;
 }
 
 int ir_publish(ir_publisher *p, const uint8_t *avro_body, size_t len) {
+  /* Read the (possibly reconnect-swapped) arena ring under the channel lock. */
+  pthread_mutex_lock(&p->reg->lock);
+  ring rg = p->reg->ring;
+  uint64_t fp = p->reg->schema_fp;
+  pthread_mutex_unlock(&p->reg->lock);
   size_t flen;
-  uint8_t *frame = frame_encode(p->schema_fp, avro_body, len, &flen);
+  uint8_t *frame = frame_encode(fp, avro_body, len, &flen);
   if (!frame)
     return IR_ERR;
-  int rc = ring_push(&p->ring, frame, flen, 1000);
+  int rc = ring_push(&rg, frame, flen, 1000);
   free(frame);
   return rc == 0 ? IR_OK : (rc == IR_ERR_TIMEOUT ? IR_ERR_TIMEOUT : IR_ERR);
 }
@@ -1048,23 +1449,44 @@ int ir_publish(ir_publisher *p, const uint8_t *avro_body, size_t len) {
 void ir_publisher_free(ir_publisher *p) {
   if (!p)
     return;
-  seg_close(&p->arena);
+  ir_conn *c = p->c;
+  chan_reg *cr = p->reg;
+  /* Unlink from the connection's channel list so a reconnect stops replaying it. */
+  pthread_mutex_lock(&c->svc_lock);
+  chan_reg **pp = &c->channels;
+  while (*pp) {
+    if (*pp == cr) {
+      *pp = cr->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  pthread_mutex_unlock(&c->svc_lock);
+  seg_close(&cr->arena);
+  pthread_mutex_destroy(&cr->lock);
+  free(cr->schema_json);
+  free(cr->key);
+  free(cr);
   free(p);
 }
 
 int ir_list_channels(ir_conn *c, ir_channel_info *out, size_t max, size_t *count) {
-  int64_t corr = rand_i64();
-  ir_avro_w *w = ir_avro_w_new();
-  ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
-  size_t blen;
-  const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;
   uint8_t *rbody;
   size_t rlen;
-  int rc = control_call(c, FP_LIST, body, blen, corr, 5000, &rfp, &rbody, &rlen);
-  ir_avro_w_free(w);
-  if (rc != 0) {
+  for (int attempt = 0;; attempt++) {
+    int64_t corr = rand_i64();
+    ir_avro_w *w = ir_avro_w_new();
+    ir_avro_put_long(w, corr);
+    ir_avro_put_long(w, client_id_of(c));
+    size_t blen;
+    const uint8_t *body = ir_avro_w_bytes(w, &blen);
+    int rc = control_call(c, FP_LIST, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+    ir_avro_w_free(w);
+    if (rc == 0)
+      break;
+    if (attempt == 0 && reconnect_if_restarted(c, rc))
+      continue;
     set_err(c, "list timed out");
     return IR_ERR_TIMEOUT;
   }
@@ -1100,21 +1522,25 @@ int ir_list_channels(ir_conn *c, ir_channel_info *out, size_t max, size_t *count
 }
 
 ir_subscriber *ir_subscribe(ir_conn *c, int64_t channel_id, const char *key) {
-  int64_t corr = rand_i64();
-  ir_avro_w *w = ir_avro_w_new();
-  ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
-  ir_avro_put_long(w, channel_id);
-  ir_avro_put_string(w, key ? key : "");
-  ir_avro_put_long(w, 0); /* expected_fp = 0: broker computes/owns fingerprints */
-  size_t blen;
-  const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;
   uint8_t *rbody;
   size_t rlen;
-  int rc = control_call(c, FP_SUBSCRIBE, body, blen, corr, 5000, &rfp, &rbody, &rlen);
-  ir_avro_w_free(w);
-  if (rc != 0) {
+  for (int attempt = 0;; attempt++) {
+    int64_t corr = rand_i64();
+    ir_avro_w *w = ir_avro_w_new();
+    ir_avro_put_long(w, corr);
+    ir_avro_put_long(w, client_id_of(c));
+    ir_avro_put_long(w, channel_id);
+    ir_avro_put_string(w, key ? key : "");
+    ir_avro_put_long(w, 0); /* expected_fp = 0: broker computes/owns fingerprints */
+    size_t blen;
+    const uint8_t *body = ir_avro_w_bytes(w, &blen);
+    int rc = control_call(c, FP_SUBSCRIBE, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+    ir_avro_w_free(w);
+    if (rc == 0)
+      break;
+    if (attempt == 0 && reconnect_if_restarted(c, rc))
+      continue;
     set_err(c, "subscribe timed out");
     return NULL;
   }
@@ -1202,9 +1628,16 @@ static ring *caller_ring(service *sv, const char *name) {
 static void *service_main(void *arg) {
   service *sv = (service *)arg;
   while (*sv->running) {
+    /* Snapshot the request ring + fingerprints under the lock so a reconnect's
+     * re-expose (which swaps the arena) is picked up on the next iteration. */
+    pthread_mutex_lock(&sv->lock);
+    ring req_ring = sv->req_ring;
+    uint64_t req_fp = sv->req_fp;
+    uint64_t resp_fp = sv->resp_fp;
+    pthread_mutex_unlock(&sv->lock);
     uint8_t *rec = NULL;
     size_t n = 0;
-    if (!ring_pop_blocking(&sv->req_ring, 100, &rec, &n))
+    if (!ring_pop_blocking(&req_ring, 100, &rec, &n))
       continue;
     uint64_t fp;
     const uint8_t *body;
@@ -1227,7 +1660,7 @@ static void *service_main(void *arg) {
     const char *emsg = "";
     uint8_t *result = NULL;
     size_t result_len = 0;
-    if ((uint64_t)arg_fp != sv->req_fp) {
+    if ((uint64_t)arg_fp != req_fp) {
       status = ST_MISMATCH;
       emsg = "request schema mismatch";
     } else if (sv->handler(args, (size_t)args_len, &result, &result_len, sv->user) != 0) {
@@ -1241,7 +1674,7 @@ static void *service_main(void *arg) {
     ir_avro_put_long(w, corr);
     ir_avro_put_int(w, status);
     ir_avro_put_string(w, emsg);
-    ir_avro_put_long(w, status == ST_OK ? (int64_t)sv->resp_fp : 0);
+    ir_avro_put_long(w, status == ST_OK ? (int64_t)resp_fp : 0);
     ir_avro_put_bytes(w, result ? result : (const uint8_t *)"", result_len);
     size_t wlen;
     const uint8_t *wbody = ir_avro_w_bytes(w, &wlen);
@@ -1267,23 +1700,27 @@ int ir_expose_function(ir_conn *c, const char *name, const char *req_schema_json
 int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_schema_json,
                                   const char *resp_schema_json, const char *key, uint64_t req_arena_cap,
                                   ir_handler handler, void *user) {
-  int64_t corr = rand_i64();
-  ir_avro_w *w = ir_avro_w_new();
-  ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
-  ir_avro_put_string(w, name);
-  ir_avro_put_string(w, req_schema_json);
-  ir_avro_put_string(w, resp_schema_json);
-  ir_avro_put_string(w, key ? key : "");
-  ir_avro_put_long(w, (int64_t)req_arena_cap);
-  size_t blen;
-  const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;
   uint8_t *rbody;
   size_t rlen;
-  int rc = control_call(c, FP_EXPOSE, body, blen, corr, 5000, &rfp, &rbody, &rlen);
-  ir_avro_w_free(w);
-  if (rc != 0) {
+  for (int attempt = 0;; attempt++) {
+    int64_t corr = rand_i64();
+    ir_avro_w *w = ir_avro_w_new();
+    ir_avro_put_long(w, corr);
+    ir_avro_put_long(w, client_id_of(c));
+    ir_avro_put_string(w, name);
+    ir_avro_put_string(w, req_schema_json);
+    ir_avro_put_string(w, resp_schema_json);
+    ir_avro_put_string(w, key ? key : "");
+    ir_avro_put_long(w, (int64_t)req_arena_cap);
+    size_t blen;
+    const uint8_t *body = ir_avro_w_bytes(w, &blen);
+    int rc = control_call(c, FP_EXPOSE, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+    ir_avro_w_free(w);
+    if (rc == 0)
+      break;
+    if (attempt == 0 && reconnect_if_restarted(c, rc))
+      continue;
     set_err(c, "expose timed out");
     return IR_ERR_TIMEOUT;
   }
@@ -1306,9 +1743,11 @@ int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_
   }
   free(msg);
   service *sv = (service *)calloc(1, sizeof(*sv));
+  pthread_mutex_init(&sv->lock, NULL);
   if (seg_open(req_arena, &sv->arena) != 0 || ring_attach(&sv->req_ring, (uint8_t *)sv->arena.addr) != 0) {
     set_err(c, "cannot map function arena");
     free(req_arena);
+    pthread_mutex_destroy(&sv->lock);
     free(sv);
     return IR_ERR;
   }
@@ -1318,6 +1757,12 @@ int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_
   sv->handler = handler;
   sv->user = user;
   sv->running = &c->running;
+  /* Replay spec so a reconnect can re-expose this function. */
+  sv->name = strdup(name);
+  sv->req_schema_json = strdup(req_schema_json);
+  sv->resp_schema_json = strdup(resp_schema_json);
+  sv->key = key ? strdup(key) : NULL;
+  sv->arena_cap = (int64_t)req_arena_cap;
   pthread_mutex_lock(&c->svc_lock);
   sv->next = c->services;
   c->services = sv;
@@ -1329,13 +1774,13 @@ int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_
   return IR_OK;
 }
 
-int ir_call(ir_conn *c, const char *fn_name, const char *key, const uint8_t *req, size_t req_len, int timeout_ms,
-            uint8_t **resp, size_t *resp_len) {
+static int ir_call_once(ir_conn *c, const char *fn_name, const char *key, const uint8_t *req, size_t req_len,
+                        int timeout_ms, uint8_t **resp, size_t *resp_len) {
   /* 1. Lookup the function (broker returns fingerprints + arena). */
   int64_t corr = rand_i64();
   ir_avro_w *w = ir_avro_w_new();
   ir_avro_put_long(w, corr);
-  ir_avro_put_long(w, c->client_id);
+  ir_avro_put_long(w, client_id_of(c));
   ir_avro_put_string(w, fn_name);
   ir_avro_put_string(w, key ? key : "");
   size_t blen;
@@ -1379,12 +1824,17 @@ int ir_call(ir_conn *c, const char *fn_name, const char *key, const uint8_t *req
   }
   free(req_arena);
 
+  char reply_name[256];
+  pthread_mutex_lock(&c->tx_lock);
+  snprintf(reply_name, sizeof reply_name, "%s", c->reply.name);
+  pthread_mutex_unlock(&c->tx_lock);
+
   int64_t rpc_corr = rand_i64();
   slot *s = slot_register(c, rpc_corr);
   ir_avro_w *rw = ir_avro_w_new();
   ir_avro_put_long(rw, rpc_corr);
-  ir_avro_put_long(rw, c->client_id);
-  ir_avro_put_string(rw, c->reply.name);
+  ir_avro_put_long(rw, client_id_of(c));
+  ir_avro_put_string(rw, reply_name);
   ir_avro_put_long(rw, req_fp); /* arg_fp = broker-derived request fp */
   ir_avro_put_bytes(rw, req, req_len);
   size_t rwlen;
@@ -1441,4 +1891,39 @@ int ir_call(ir_conn *c, const char *fn_name, const char *key, const uint8_t *req
   *resp = result;
   *resp_len = (size_t)result_len;
   return IR_OK;
+}
+
+int ir_call(ir_conn *c, const char *fn_name, const char *key, const uint8_t *req, size_t req_len, int timeout_ms,
+            uint8_t **resp, size_t *resp_len) {
+  for (int attempt = 0;; attempt++) {
+    int rc = ir_call_once(c, fn_name, key, req, req_len, timeout_ms, resp, resp_len);
+    if (rc != IR_ERR_TIMEOUT)
+      return rc;
+    if (attempt == 0 && reconnect_if_restarted(c, rc))
+      continue;
+    return rc;
+  }
+}
+
+/* ---- broker-restart introspection / control ---- */
+
+int64_t ir_broker_epoch(const ir_conn *c) {
+  ir_conn *cc = (ir_conn *)c;
+  pthread_mutex_lock(&cc->tx_lock);
+  int64_t e = cc->epoch;
+  pthread_mutex_unlock(&cc->tx_lock);
+  return e;
+}
+
+int ir_broker_restarted(const ir_conn *c) {
+  int64_t observed = ir_broker_epoch(c);
+  int64_t live;
+  if (live_broker_epoch(&live) != 0)
+    return 1; /* broker currently unreachable */
+  return live != observed ? 1 : 0;
+}
+
+void ir_set_auto_reconnect(ir_conn *c, int on) {
+  if (c)
+    c->auto_reconnect = on ? 1 : 0;
 }

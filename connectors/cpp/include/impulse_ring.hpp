@@ -186,6 +186,20 @@ public:
     return Subscriber(s);
   }
 
+  // ---- broker-restart recovery ----
+  // The underlying C connection transparently reconnects and replays its
+  // published channels / exposed functions when impulsed restarts; these expose
+  // and control that behaviour.
+
+  // The broker epoch this connection is attached under (changes on a restart).
+  std::int64_t broker_epoch() const { return ir_broker_epoch(c_); }
+
+  // True if impulsed has restarted (or is currently unreachable) since connect.
+  bool broker_restarted() const { return ir_broker_restarted(c_) != 0; }
+
+  // Enable/disable transparent reconnect on a detected restart (default: on).
+  void set_auto_reconnect(bool on) { ir_set_auto_reconnect(c_, on ? 1 : 0); }
+
   // `req_arena_cap` requests a request-arena capacity in bytes (0 = broker
   // default); the broker clamps it to [256 KiB, 128 MiB] and rounds up to a
   // power of two.

@@ -55,3 +55,34 @@ The broker is never on the data hot path. After the control handshake:
 * Each connector `shm_unlink`s its own reply segment on disconnect.
 * The broker `shm_unlink`s the control segment and all arenas on shutdown; its
   startup scan recovers anything left by a crash.
+
+## Broker restart & reconnect
+
+When `impulsed` restarts it garbage-collects **all** Ring segments (including
+every connector's reply segment and arenas) and writes a fresh `epoch` into the
+new control superblock (offset 16, the broker start time in nanoseconds). An
+already-connected connector is therefore left with a dead submission ring, a
+reply segment the new broker never opened, and a `client_id` it never issued —
+every subsequent call simply times out.
+
+A connector detects this **without a socket** by re-reading `epoch`:
+
+1. Record `epoch` at attach time.
+2. Re-open the control segment **by name** (a fresh `shm_open`; the cached
+   mapping still points at the unlinked pre-restart segment) and read `epoch`.
+   A different value means the broker restarted; a failed open means it is
+   currently down. Connectors do this both proactively (a background watcher
+   polls the epoch, so an idle RPC server recovers too) and lazily (a control or
+   RPC call that stops being answered triggers the same check).
+3. On a confirmed restart, **reconnect**: re-attach the control segment, create a
+   new reply segment, re-`Register` under the same `app_name` (obtaining a new
+   `client_id`), then **replay** the connection's own registrations — re-publish
+   each channel it published and re-`ExposeFunction` each function it exposed —
+   rebinding the live publisher/service handles to the new arenas. The failed
+   operation is then retried once.
+
+Subscribers are not auto-replayed: a channel's `channel_id` is not stable across
+a restart and its publisher lives in another process, so a consumer re-resolves
+the channel by name and re-`Subscribe`s. This recovery is the connector's
+responsibility (the wire protocol is unchanged); see the native Rust connector
+for the reference implementation.

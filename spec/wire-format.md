@@ -134,7 +134,8 @@ offset 64:
 | 0      | 8    | `magic`      | `"IMPRING\0"` as LE u64        |
 | 8      | 4    | `version`    | `1`                            |
 | 12     | 4    | `broker_pid` |                                |
-| 16     | 8    | `epoch`      | broker start time (ns), bumps each run |
+| 16     | 8    | `epoch`      | broker start time (ns), bumps each run; a connector that sees a changed `epoch` on a fresh open knows the broker restarted |
 | 64     | …    | submission ring (clients → broker, MPSC) |
 
-See `bootstrap.md` for the connection handshake.
+See `bootstrap.md` for the connection handshake and for how connectors use
+`epoch` to detect a broker restart and transparently reconnect.
