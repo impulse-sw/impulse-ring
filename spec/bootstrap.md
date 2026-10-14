@@ -47,7 +47,13 @@ The broker is never on the data hot path. After the control handshake:
   to `[MIN_ARENA_CAP, MAX_ARENA_CAP]` and rounds it up to a power of two, and both
   ends read what it actually allocated out of the ring header.
 * **RPC:** `ExposeFunction` creates the function's request arena (service is the
-  consumer). A caller `LookupFunction` to learn the arena name and the request/
+  consumer). One thread reads that arena, because it is single-consumer, and
+  hands each request to a pool of workers (`DEFAULT_SERVICE_WORKERS`, lazily
+  spawned): a handler that waits — a long poll, a slow store — must not stop the
+  other callers of the same function, and a handler that panics answers an error
+  instead of ending the service. Responses may therefore leave out of order,
+  which costs nothing: a caller matches them by `correlation_id`, and a reply
+  ring serialises its producers. A caller `LookupFunction` to learn the arena name and the request/
   response fingerprints, validates compatibility, then writes an `RpcRequest`
   (with its own `reply_segment` and a fresh `correlation_id`) into the request
   arena. The service runs the handler and writes an `RpcResponse` into the

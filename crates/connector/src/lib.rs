@@ -47,6 +47,7 @@ use impulse_ring_core::util;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -55,6 +56,9 @@ use std::time::Duration;
 pub struct Connection {
   inner: Arc<Inner>,
   threads: Mutex<Vec<JoinHandle<()>>>,
+  /// How many requests an exposed function may answer at once. Read when the
+  /// function is exposed; see [`Connection::set_service_workers`].
+  service_workers: AtomicUsize,
 }
 
 impl Connection {
@@ -76,6 +80,7 @@ impl Connection {
     Ok(Connection {
       inner,
       threads: Mutex::new(threads),
+      service_workers: AtomicUsize::new(rpc::DEFAULT_SERVICE_WORKERS),
     })
   }
 
@@ -153,8 +158,33 @@ impl Connection {
     Ok(Subscriber::new(Arc::new(RwLock::new(ring)), Arc::new(schema), fp))
   }
 
-  /// Expose a function. `handler` runs on a dedicated service thread, decoding
-  /// `Req` and encoding `Resp` with the supplied Avro schemas.
+  /// How many requests each function exposed afterwards may answer at once
+  /// (default [`DEFAULT_SERVICE_WORKERS`]).
+  ///
+  /// Worth raising for a service whose handlers *wait* — a long poll, a slow
+  /// store, an upstream of its own — because such a handler holds its worker
+  /// without using a CPU, and when every worker is held the requests pile up in
+  /// the request arena until callers get `function request ring full`. Worth
+  /// lowering to `1` only to get the old strictly-serial behaviour back, for a
+  /// handler that is not safe to run concurrently with itself.
+  ///
+  /// Threads are spawned lazily, so this is a ceiling, not a cost.
+  pub fn set_service_workers(&self, workers: usize) {
+    self.service_workers.store(workers.max(1), AtomicOrdering::Relaxed);
+  }
+
+  /// How many requests each function exposed afterwards may answer at once.
+  pub fn service_workers(&self) -> usize {
+    self.service_workers.load(AtomicOrdering::Relaxed)
+  }
+
+  /// Expose a function. `handler` runs on a pool of service threads (see
+  /// [`Connection::set_service_workers`]), decoding `Req` and encoding `Resp`
+  /// with the supplied Avro schemas.
+  ///
+  /// The handler may therefore run concurrently with itself, and must be `Sync`.
+  /// A panic inside it answers the caller an error instead of killing the
+  /// service.
   ///
   /// The function's request arena uses the broker's default capacity; use
   /// [`Connection::expose_function_with_arena`] to size it explicitly.
@@ -169,7 +199,7 @@ impl Connection {
   where
     Req: DeserializeOwned,
     Resp: Serialize,
-    F: Fn(Req) -> Resp + Send + 'static,
+    F: Fn(Req) -> Resp + Send + Sync + 'static,
   {
     self.expose_function_with_arena(name, req_schema_json, resp_schema_json, key, 0, handler)
   }
@@ -193,7 +223,7 @@ impl Connection {
   where
     Req: DeserializeOwned,
     Resp: Serialize,
-    F: Fn(Req) -> Resp + Send + 'static,
+    F: Fn(Req) -> Resp + Send + Sync + 'static,
   {
     let (req_schema, _req_fp) = avro::parse(req_schema_json)?;
     let (resp_schema, _resp_fp) = avro::parse(resp_schema_json)?;
@@ -222,6 +252,7 @@ impl Connection {
       resp_fp,
       handler,
       self.inner.running(),
+      self.service_workers.load(AtomicOrdering::Relaxed),
     );
     self.threads.lock().unwrap().push(handle);
     Ok(())

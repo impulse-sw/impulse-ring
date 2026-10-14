@@ -296,6 +296,87 @@ fn full_flow_pubsub_and_rpc() {
         .expect("arena capacity"),
       4 * 1024 * 1024
     );
+    // --- A handler that waits must not stop the others, and one that panics must
+    // not take the service with it.
+    //
+    // Both used to be fatal: the handler ran on the thread that read the request,
+    // so an exposed function answered strictly one request at a time (a long poll
+    // stopped every other caller until the arena was full and callers got
+    // `function request ring full`), and a panic unwound that thread, leaving the
+    // application registered on the bus and permanently deaf.
+    svc
+      .expose_function::<AddReq, AddResp, _>("slow.add", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |req| {
+        std::thread::sleep(Duration::from_millis(400));
+        AddResp { sum: req.a + req.b }
+      })
+      .expect("expose slow.add");
+    svc
+      .expose_function::<AddReq, AddResp, _>("boom", ADD_REQ_SCHEMA, ADD_RESP_SCHEMA, None, |_req| {
+        panic!("a handler that panics");
+      })
+      .expect("expose boom");
+
+    let other = Connection::connect("client-concurrent").expect("connect");
+    let held = std::thread::spawn(move || {
+      other.call_blocking::<AddReq, AddResp>(
+        "slow.add",
+        None,
+        &AddReq { a: 1, b: 1 },
+        ADD_REQ_SCHEMA,
+        ADD_RESP_SCHEMA,
+        Duration::from_secs(5),
+      )
+    });
+    std::thread::sleep(Duration::from_millis(50)); // let the first call be in flight
+    let began = std::time::Instant::now();
+    let second: AddResp = client
+      .call_blocking(
+        "slow.add",
+        None,
+        &AddReq { a: 20, b: 22 },
+        ADD_REQ_SCHEMA,
+        ADD_RESP_SCHEMA,
+        Duration::from_secs(5),
+      )
+      .expect("the second call to a held function");
+    let waited = began.elapsed();
+    assert_eq!(second.sum, 42);
+    // The handler itself sleeps 400 ms, so that is the floor. What distinguishes
+    // the two worlds is what comes *before* it: served alongside the first call,
+    // this one waits only its own handler (~400 ms); served after it, it waits the
+    // rest of the first (~350 ms) and then its own (~750 ms total).
+    assert!(
+      waited < Duration::from_millis(600),
+      "the second call took {waited:?}, about the two handlers back to back: it waited out \
+       the first one, so the function still answers one request at a time"
+    );
+    assert_eq!(held.join().expect("joined").expect("the held call").sum, 2);
+
+    // A panic is answered, and the function keeps answering afterwards: the
+    // second call is the one that would have timed out before.
+    for attempt in 1..=2 {
+      let answered = client.call_blocking::<AddReq, AddResp>(
+        "boom",
+        None,
+        &AddReq { a: 1, b: 1 },
+        ADD_REQ_SCHEMA,
+        ADD_RESP_SCHEMA,
+        Duration::from_secs(2),
+      );
+      assert!(
+        answered.is_err(),
+        "a panicking handler must answer an error (attempt {attempt})"
+      );
+      let said = match answered {
+        Err(e) => e.to_string(),
+        Ok(_) => unreachable!("asserted above"),
+      };
+      assert!(
+        said.contains("panicked"),
+        "the error should say what happened, got: {said}"
+      );
+    }
+
   } // connections dropped here -> reply segments unlinked, threads joined
 
   // Per-connection reply ring: every reply to a connection travels through one
