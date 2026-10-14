@@ -68,6 +68,41 @@ test("TS subscribes to and calls the Rust peer", () => {
   conn.close();
 });
 
+const METRIC_SCHEMA =
+  '{"type":"record","name":"Metric","namespace":"ring.examples","fields":' +
+  '[{"name":"name","type":"string"},{"name":"value","type":"double"}]}';
+
+// Ring sizes: a publisher sizes its channel's arena, a caller sizes its own reply
+// ring, and both ends read back what the broker actually allocated — which is
+// what makes it sound to derive a message size limit from.
+test("ring sizes are sizable and readable", () => {
+  const conn = new Connection("ts-sizes");
+  expect(conn.replyCapacity()).toBe(64 * 1024);
+
+  const roomy = new Connection("ts-roomy", 1024 * 1024);
+  expect(roomy.replyCapacity()).toBe(1024 * 1024);
+  roomy.close();
+
+  const plain = conn.publishChannel("ts-plain", METRIC_SCHEMA);
+  expect(plain.capacity()).toBe(512 * 1024);
+  const big = conn.publishChannel("ts-big", METRIC_SCHEMA, "", 3 * 1024 * 1024);
+  expect(big.capacity()).toBe(4 * 1024 * 1024); // clamped up to a power of two
+
+  let bigId: bigint | null = null;
+  for (const c of conn.listChannels()) if (c.name === "ts-big") bigId = c.channelId;
+  expect(bigId).not.toBeNull();
+  const sub = conn.subscribe(bigId!);
+  expect(sub.capacity()).toBe(big.capacity()); // same ring header, so no disagreement
+  sub.close();
+
+  // The Rust peer exposed `rmul` with the default arena.
+  expect(conn.functionArenaCapacity("rmul")).toBe(512 * 1024);
+
+  big.close();
+  plain.close();
+  conn.close();
+});
+
 function callRmul(conn: Connection): number | null {
   try {
     const req = new Encoder().putLong(6).putLong(7).bytes_();

@@ -60,11 +60,38 @@ pub struct Connection {
 impl Connection {
   /// Connect to the broker and register `app_name` on the bus.
   pub fn connect(app_name: &str) -> io::Result<Connection> {
-    let (inner, threads) = Inner::connect(app_name)?;
+    Self::connect_with_reply_cap(app_name, 0)
+  }
+
+  /// Connect, asking for a reply ring of `reply_cap` bytes (`0` = default).
+  ///
+  /// Every reply to this connection travels through one ring — control replies
+  /// and RPC responses alike — so its capacity is the ceiling on an inline
+  /// response, and a burst of large replies on a small ring is what makes a
+  /// caller see dropped control replies and time out. A caller that expects large
+  /// responses (a reverse proxy, say) asks for a bigger one here;
+  /// [`Connection::reply_capacity`] reports what it got.
+  pub fn connect_with_reply_cap(app_name: &str, reply_cap: usize) -> io::Result<Connection> {
+    let (inner, threads) = Inner::connect(app_name, reply_cap)?;
     Ok(Connection {
       inner,
       threads: Mutex::new(threads),
     })
+  }
+
+  /// Bytes of data region this connection's reply ring holds.
+  pub fn reply_capacity(&self) -> usize {
+    self.inner.reply_capacity()
+  }
+
+  /// Capacity of a function's request arena, as the broker allocated it.
+  ///
+  /// What a caller needs to size its own requests by: a record bigger than the
+  /// arena never fits, and one that fills it leaves no room for anybody else.
+  /// Costs one control round-trip, so a caller that asks per request should
+  /// remember the answer.
+  pub fn function_arena_capacity(&self, fn_name: &str, key: Option<&str>) -> io::Result<usize> {
+    self.inner.with_reconnect(|| self.inner.function_arena_capacity(fn_name, key))
   }
 
   fn next_corr() -> i64 {
@@ -73,15 +100,36 @@ impl Connection {
 
   /// Publish a channel with the given Avro schema. `key` gates subscribers.
   pub fn publish_channel(&self, name: &str, schema_json: &str, key: Option<&str>) -> io::Result<Publisher> {
+    self.publish_channel_with_arena(name, schema_json, key, 0)
+  }
+
+  /// Publish a channel, requesting an arena capacity of `arena_cap` bytes
+  /// (`0` = broker default).
+  ///
+  /// How big a frame may travel on a channel follows from how big its arena is,
+  /// and only the publisher knows how big its frames are: a chunked HTTP body, an
+  /// SSE event and a WebSocket message have nothing in common but the channel.
+  /// The broker clamps the request to `[MIN_ARENA_CAP, MAX_ARENA_CAP]` and rounds
+  /// it up to a power of two (see `impulse_ring_core::control::clamp_arena_cap`);
+  /// [`Publisher::capacity`] reports what it got.
+  pub fn publish_channel_with_arena(
+    &self,
+    name: &str,
+    schema_json: &str,
+    key: Option<&str>,
+    arena_cap: usize,
+  ) -> io::Result<Publisher> {
     let (schema, _fp) = avro::parse(schema_json)?;
+    let arena_cap = arena_cap as i64;
     let (ring, fp) = self
       .inner
-      .with_reconnect(|| self.inner.do_publish(name, schema_json, key))?;
+      .with_reconnect(|| self.inner.do_publish(name, schema_json, key, arena_cap))?;
     let cell: RingCell = Arc::new(RwLock::new(ring));
     let id = self.inner.register_entry(Reg::Channel {
       name: name.to_string(),
       schema_json: schema_json.to_string(),
       key: key.map(str::to_string),
+      arena_cap,
       ring: cell.clone(),
     });
     Ok(Publisher::new(cell, Arc::new(schema), fp, self.inner.clone(), id))

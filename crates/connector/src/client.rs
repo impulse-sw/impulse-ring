@@ -33,8 +33,8 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 pub type RingCell = Arc<RwLock<Ring>>;
 
 /// Snapshot of a published channel to replay after a reconnect:
-/// `(name, schema_json, key, ring-cell to rebind)`.
-type ChannelReplay = (String, String, Option<String>, RingCell);
+/// `(name, schema_json, key, arena_cap, ring-cell to rebind)`.
+type ChannelReplay = (String, String, Option<String>, i64, RingCell);
 /// Snapshot of an exposed function to replay after a reconnect:
 /// `(name, req_schema, resp_schema, key, arena_cap, ring-cell to rebind)`.
 type FunctionReplay = (String, String, String, Option<String>, i64, RingCell);
@@ -119,6 +119,10 @@ pub enum Reg {
     name: String,
     schema_json: String,
     key: Option<String>,
+    /// Requested arena capacity, replayed verbatim: a channel that came back
+    /// from a broker restart with the default arena would silently reject the
+    /// frames its publisher had been sending all along.
+    arena_cap: i64,
     ring: RingCell,
   },
   /// An exposed function; `ring` is the service loop's request-arena cell.
@@ -138,6 +142,10 @@ pub struct Inner {
   pub pending: Mutex<HashMap<i64, Arc<Slot>>>,
   /// The local name we registered under (replayed verbatim on reconnect).
   app_name: String,
+  /// Requested reply-ring capacity, kept so a reconnect rebuilds the same ring:
+  /// a connection that came back with the default would start chunking replies
+  /// its caller had been getting inline.
+  reply_cap: usize,
   pub running: Arc<AtomicBool>,
   /// Whether a detected broker restart triggers a transparent reconnect.
   auto_reconnect: AtomicBool,
@@ -151,7 +159,7 @@ pub struct Inner {
 /// Open the control segment fresh, create a new reply segment, and assemble a
 /// [`Transport`] (not yet registered: `client_id` is 0). Used by both the initial
 /// connect and every reconnect.
-fn bootstrap() -> io::Result<Transport> {
+fn bootstrap(reply_cap: usize) -> io::Result<Transport> {
   let control_seg = Arc::new(Segment::open(util::CONTROL_SEGMENT).map_err(|e| {
     io::Error::new(
       e.kind(),
@@ -163,8 +171,18 @@ fn bootstrap() -> io::Result<Transport> {
 
   let nonce = util::random_u64();
   let reply_name = util::client_segment(nonce);
-  let reply_seg = Arc::new(Segment::create(&reply_name, ring_bytes(control::REPLY_CAP))?);
-  let reply_ring = Ring::format(reply_seg.clone(), 0, control::REPLY_CAP)?;
+  // The reply ring is this client's own: it creates the segment, so it decides
+  // how big a reply it is willing to receive. Every reply to this connection —
+  // control replies and RPC responses alike — travels through it, so a client
+  // that expects large responses must say so here, or they come back chunked
+  // over a channel instead.
+  // `0` means this client has no opinion, and then the answer is the reply ring's
+  // own default — not the arena default that `clamp_arena_cap` falls back to. The
+  // two constants are equal today; naming the right one keeps this correct if they
+  // ever stop being.
+  let reply_cap = control::clamp_arena_cap(if reply_cap == 0 { control::REPLY_CAP } else { reply_cap });
+  let reply_seg = Arc::new(Segment::create(&reply_name, ring_bytes(reply_cap))?);
+  let reply_ring = Ring::format(reply_seg.clone(), 0, reply_cap)?;
 
   Ok(Transport {
     submission,
@@ -198,9 +216,9 @@ impl Inner {
   /// Connect to the broker: bootstrap a transport, start the background threads,
   /// and register `app_name`. On a registration failure the threads are stopped
   /// before returning the error.
-  pub fn connect(app_name: &str) -> io::Result<(Arc<Inner>, Vec<JoinHandle<()>>)> {
-    let transport = bootstrap()?;
-    let (inner, threads) = Inner::start(app_name, transport);
+  pub fn connect(app_name: &str, reply_cap: usize) -> io::Result<(Arc<Inner>, Vec<JoinHandle<()>>)> {
+    let transport = bootstrap(reply_cap)?;
+    let (inner, threads) = Inner::start(app_name, reply_cap, transport);
     if let Err(e) = inner.do_register() {
       inner.running.store(false, Ordering::Relaxed);
       for h in threads {
@@ -214,11 +232,12 @@ impl Inner {
   /// Build the shared state from an initial transport and start the background
   /// dispatcher + restart watcher. Returns the `Arc<Inner>` and the thread
   /// handles (owned by the [`Connection`](crate::Connection)).
-  fn start(app_name: &str, transport: Transport) -> (Arc<Inner>, Vec<JoinHandle<()>>) {
+  fn start(app_name: &str, reply_cap: usize, transport: Transport) -> (Arc<Inner>, Vec<JoinHandle<()>>) {
     let inner = Arc::new(Inner {
       transport: RwLock::new(transport),
       pending: Mutex::new(HashMap::new()),
       app_name: app_name.to_string(),
+      reply_cap,
       running: Arc::new(AtomicBool::new(true)),
       auto_reconnect: AtomicBool::new(true),
       reconnect_mu: Mutex::new(()),
@@ -238,6 +257,20 @@ impl Inner {
 
   pub fn reply_segment(&self) -> String {
     self.transport.read().unwrap().reply_segment.clone()
+  }
+
+  /// Bytes of data region this connection's reply ring holds.
+  pub fn reply_capacity(&self) -> usize {
+    self.transport.read().unwrap().reply_ring.capacity()
+  }
+
+  /// Capacity of a function's request arena: one lookup, then the arena's own
+  /// header. Both ends read it from the same place, so neither has to assume
+  /// what the other kept to.
+  pub fn function_arena_capacity(&self, fn_name: &str, key: Option<&str>) -> io::Result<usize> {
+    let lr = self.do_lookup(fn_name, key)?;
+    let seg = Arc::new(Segment::open(&lr.req_arena)?);
+    Ok(Ring::attach(seg, 0)?.capacity())
   }
 
   pub fn epoch(&self) -> u64 {
@@ -331,7 +364,16 @@ impl Inner {
   }
 
   /// Publish a channel and attach its arena ring.
-  pub fn do_publish(&self, name: &str, schema_json: &str, key: Option<&str>) -> io::Result<(Ring, Fingerprint)> {
+  ///
+  /// `arena_cap` is the requested arena capacity in bytes (`0` = broker default):
+  /// how big a frame may travel on this channel follows from it.
+  pub fn do_publish(
+    &self,
+    name: &str,
+    schema_json: &str,
+    key: Option<&str>,
+    arena_cap: i64,
+  ) -> io::Result<(Ring, Fingerprint)> {
     let corr = Self::next_corr();
     let frame = proto::to_frame(
       Kind::PublishChannel,
@@ -341,6 +383,7 @@ impl Inner {
         channel: name.to_string(),
         schema_json: schema_json.to_string(),
         access_key: key.unwrap_or("").to_string(),
+        arena_cap,
       },
     )?;
     let reply = self.call_control(corr, frame, CONTROL_TIMEOUT)?;
@@ -497,7 +540,7 @@ impl Inner {
       "impulsed restart detected (epoch was {failed_epoch}); reconnecting '{}'",
       self.app_name
     );
-    let transport = bootstrap()?;
+    let transport = bootstrap(self.reply_cap)?;
     let new_epoch = transport.epoch;
     // In-flight calls bound to the dead broker will never be answered.
     self.pending.lock().unwrap().clear();
@@ -524,8 +567,15 @@ impl Inner {
             name,
             schema_json,
             key,
+            arena_cap,
             ring,
-          } => channels.push((name.clone(), schema_json.clone(), key.clone(), ring.clone())),
+          } => channels.push((
+            name.clone(),
+            schema_json.clone(),
+            key.clone(),
+            *arena_cap,
+            ring.clone(),
+          )),
           Reg::Function {
             name,
             req_schema_json,
@@ -547,8 +597,8 @@ impl Inner {
     };
     // Best-effort per entry: a single failure is logged and does not abort the
     // rest (the watcher retries on the next tick).
-    for (name, schema_json, key, cell) in channels {
-      match self.do_publish(&name, &schema_json, key.as_deref()) {
+    for (name, schema_json, key, cap, cell) in channels {
+      match self.do_publish(&name, &schema_json, key.as_deref(), cap) {
         Ok((ring, _fp)) => *cell.write().unwrap() = ring,
         Err(e) => log::warn!("replay: re-publish '{name}' failed: {e}"),
       }

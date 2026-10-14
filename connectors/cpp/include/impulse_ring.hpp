@@ -112,6 +112,12 @@ public:
       throw Error("publish failed");
   }
 
+  // Bytes of data region the channel's arena holds, as the broker allocated it
+  // (clamped and rounded, so not necessarily what was asked for). A message
+  // bigger than this can never be published, so a publisher that cuts a stream
+  // into messages sizes them from here.
+  std::uint64_t capacity() const { return ir_publisher_capacity(p_); }
+
 private:
   ir_publisher *p_;
 };
@@ -140,6 +146,10 @@ public:
 
   uint64_t schema_fp() const { return ir_subscriber_schema_fp(s_); }
 
+  // Bytes of data region the channel's arena holds. Both ends read it out of the
+  // same ring header, so neither has to assume what the other kept to.
+  std::uint64_t capacity() const { return ir_subscriber_capacity(s_); }
+
 private:
   ir_subscriber *s_;
 };
@@ -149,7 +159,13 @@ using Handler = std::function<Bytes(const uint8_t *req, size_t len)>;
 
 class Connection {
 public:
-  explicit Connection(const std::string &app_name) : c_(ir_connect(app_name.c_str())) {
+  // `reply_cap` sizes this connection's reply ring in bytes (0 = the connector
+  // default, 64 KiB). Every reply travels through that one ring — control replies
+  // and RPC responses alike — so it is the ceiling on a response: a function
+  // whose answer does not fit fails to deliver it. The value is raised to the
+  // default if smaller, capped at 128 MiB, and rounded up to a power of two.
+  explicit Connection(const std::string &app_name, std::uint64_t reply_cap = 0)
+      : c_(ir_connect_with_reply_cap(app_name.c_str(), reply_cap)) {
     if (!c_)
       throw Error("connect failed (is impulsed running?)");
   }
@@ -160,11 +176,30 @@ public:
   Connection(const Connection &) = delete;
   Connection &operator=(const Connection &) = delete;
 
-  Publisher publish_channel(const std::string &name, const std::string &schema_json, const std::string &key = "") {
-    ir_publisher *p = ir_publish_channel(c_, name.c_str(), schema_json.c_str(), key.empty() ? nullptr : key.c_str());
+  // `arena_cap` requests an arena capacity in bytes (0 = broker default, 512
+  // KiB): the publisher sizes it, because the publisher is the side that knows
+  // how big its messages are. The broker clamps it to [256 KiB, 128 MiB] and
+  // rounds up to a power of two; Publisher::capacity reports what it got.
+  Publisher publish_channel(const std::string &name, const std::string &schema_json, const std::string &key = "",
+                            std::uint64_t arena_cap = 0) {
+    ir_publisher *p = ir_publish_channel_with_arena(c_, name.c_str(), schema_json.c_str(),
+                                                    key.empty() ? nullptr : key.c_str(), arena_cap);
     if (!p)
       throw Error(std::string("publish_channel: ") + ir_last_error(c_));
     return Publisher(p);
+  }
+
+  // Bytes of data region this connection's reply ring holds.
+  std::uint64_t reply_capacity() const { return ir_reply_capacity(c_); }
+
+  // Capacity of a function's request arena, as the broker allocated it: what a
+  // caller sizes its requests by. Costs one control round-trip, so remember the
+  // answer rather than asking per call.
+  std::uint64_t function_arena_capacity(const std::string &fn_name, const std::string &key = "") {
+    std::uint64_t cap = 0;
+    if (ir_function_arena_capacity(c_, fn_name.c_str(), key.empty() ? nullptr : key.c_str(), &cap) != IR_OK)
+      throw Error(std::string("function_arena_capacity: ") + ir_last_error(c_));
+    return cap;
   }
 
   std::vector<ChannelInfo> list_channels() {

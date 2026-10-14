@@ -41,6 +41,34 @@ a := ring.NewEncoder(); a.PutLong(7); a.PutLong(35)
 resp, _ := conn.Call("add", "", a.Bytes(), 5000)
 ```
 
+### Ring sizes
+
+Every ring on the bus has a fixed size, and each is sized by the side that knows
+what has to fit through it. The sizes are readable from both ends, so a limit
+derived from one is a limit on the ring the two sides actually share — not a
+constant each hopes the other kept to.
+
+```go
+// A channel's arena is sized by its publisher: it knows how big its messages
+// are. The broker clamps to [256 KiB, 128 MiB] and rounds up to a power of two,
+// and Capacity reports what it actually allocated — a message bigger than that
+// can never be published, so cut a stream into messages by this.
+pub, _ := conn.PublishChannelWithArena("files", schema, "", 8*1024*1024)
+chunk := pub.Capacity() / 3        // three messages in flight keeps it moving
+sub, _ := conn.Subscribe(id, "")   // the subscriber reads the same header
+_ = sub.Capacity()
+
+// A connection's reply ring is sized by the caller: every reply arrives through
+// that one ring (control replies and RPC responses alike), so it is the ceiling
+// on an answer. Raised to the default if smaller, capped at 128 MiB, rounded up.
+cli, _ := ring.ConnectWithReplyCap("my-go-client", 4*1024*1024)
+_ = cli.ReplyCapacity()
+
+// A function's request arena is sized by the service exposing it, and read by
+// the caller that writes into it (one control round-trip, so remember it).
+cap, _ := cli.FunctionArenaCapacity("upload", "")
+```
+
 See [`examples/demo`](examples/demo) for a full publish/subscribe + RPC flow.
 
 ## Tests

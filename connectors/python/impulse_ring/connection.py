@@ -71,11 +71,15 @@ def _live_broker_epoch() -> int:
 class _ChanReg:
     """A published channel, tracked so it can be replayed after a restart."""
 
-    def __init__(self, name, schema_json, key, ring, schema_fp):
+    def __init__(self, name, schema_json, key, arena_cap, ring, schema_fp):
         self.lock = threading.Lock()
         self.name = name
         self.schema_json = schema_json
         self.key = key
+        # Requested arena capacity, replayed verbatim: a channel that came back
+        # from a broker restart with the default arena would silently reject the
+        # messages its publisher had been sending all along.
+        self.arena_cap = arena_cap
         self.ring = ring
         self.schema_fp = schema_fp & _U64
 
@@ -106,6 +110,17 @@ class Publisher:
         with self._reg.lock:
             return self._reg.schema_fp
 
+    @property
+    def capacity(self) -> int:
+        """Bytes of data region the channel's arena holds, as the broker allocated
+        it (clamped and rounded, so not necessarily what was asked for).
+
+        A message bigger than this can never be published, so a publisher that
+        cuts a stream into messages sizes them from here.
+        """
+        with self._reg.lock:
+            return self._reg.ring.cap
+
     def publish(self, avro_body: bytes):
         with self._reg.lock:
             ring = self._reg.ring
@@ -119,6 +134,12 @@ class Subscriber:
         self._ring = ring
         self.schema_fp = schema_fp & _U64
 
+    @property
+    def capacity(self) -> int:
+        """Bytes of data region the channel's arena holds. Both ends read it out of
+        the same ring header, so neither has to assume what the other kept to."""
+        return self._ring.cap
+
     def recv(self, timeout_ms: int = 1000):
         """Return the next message body, or None on timeout."""
         rec = self._ring.pop_blocking(timeout_ms)
@@ -130,9 +151,35 @@ class Subscriber:
         return body
 
 
+def _resolve_reply_cap(requested: int) -> int:
+    """Turn a requested reply-ring size into a legal one: 0 (or anything smaller
+    than the default) means the default, since control replies must fit; anything
+    larger is capped and rounded up to a power of two, because a ring's capacity
+    must be one."""
+    if requested <= proto.REPLY_CAP:
+        return proto.REPLY_CAP
+    requested = min(requested, proto.MAX_ARENA_CAP)
+    cap = proto.REPLY_CAP
+    while cap < requested:
+        cap <<= 1
+    return cap
+
+
 class Connection:
-    def __init__(self, app_name: str):
+    def __init__(self, app_name: str, reply_cap: int = 0):
+        """`reply_cap` sizes this connection's reply ring in bytes (0 = the
+        connector default, 64 KiB).
+
+        Every reply travels through that one ring — control replies and RPC
+        responses alike — so it is the ceiling on a response: a function whose
+        answer does not fit fails to deliver it. A client that calls functions
+        with large responses asks for a bigger ring here; :attr:`reply_capacity`
+        reports what it got.
+        """
         self._app_name = app_name
+        # Resolved reply-ring size, kept so a reconnect rebuilds the same ring
+        # rather than falling back to the default.
+        self._reply_cap = _resolve_reply_cap(reply_cap)
         # Transport (current broker generation), guarded by _tx_lock.
         self._tx_lock = threading.Lock()
         self._ctl = None
@@ -173,8 +220,10 @@ class Connection:
         epoch = struct.unpack_from("<q", ctl, proto.CTL_OFF_EPOCH)[0]
         nonce = _new_id()
         reply_name = f"/impulse-ring.cli.{nonce}.v1"
-        reply_mm = shm.create(reply_name, ring_bytes(proto.REPLY_CAP))
-        reply_ring = Ring.format(reply_mm, 0, proto.REPLY_CAP)
+        # The reply ring is this connection's own: we create the segment, so we
+        # decide how big a reply we are willing to receive.
+        reply_mm = shm.create(reply_name, ring_bytes(self._reply_cap))
+        reply_ring = Ring.format(reply_mm, 0, self._reply_cap)
         with self._tx_lock:
             if self._ctl is not None:
                 self._retired.append(self._ctl)
@@ -188,6 +237,12 @@ class Connection:
             self._nonce = nonce
             self._epoch = epoch
             self._client_id = 0
+
+    @property
+    def reply_capacity(self) -> int:
+        """Bytes of data region this connection's reply ring holds."""
+        with self._tx_lock:
+            return self._reply_ring.cap
 
     def _client_id_tx(self):
         with self._tx_lock:
@@ -347,7 +402,7 @@ class Connection:
             svcs = list(self._services)
         for cr in chans:
             try:
-                ring, fp = self._do_publish(cr.name, cr.schema_json, cr.key)
+                ring, fp = self._do_publish(cr.name, cr.schema_json, cr.key, cr.arena_cap)
             except RingError:
                 continue
             with cr.lock:
@@ -381,7 +436,7 @@ class Connection:
             return op()
 
     # ---- channels ----
-    def _do_publish(self, name, schema_json, key):
+    def _do_publish(self, name, schema_json, key, arena_cap=0):
         corr = _new_id()
         e = avro.Encoder()
         e.put_long(corr)
@@ -389,6 +444,7 @@ class Connection:
         e.put_string(name)
         e.put_string(schema_json)
         e.put_string(key or "")
+        e.put_long(arena_cap)
         _, body = self._control_call(proto.FP_PUBLISH, e.getvalue(), corr, 5.0)
         d = avro.Decoder(body)
         d.get_long()
@@ -402,9 +458,19 @@ class Connection:
         mm = shm.open_segment(arena)
         return Ring.attach(mm, 0), schema_fp
 
-    def publish_channel(self, name, schema_json, key=None) -> Publisher:
-        ring, schema_fp = self._with_reconnect(lambda: self._do_publish(name, schema_json, key))
-        reg = _ChanReg(name, schema_json, key, ring, schema_fp)
+    def publish_channel(self, name, schema_json, key=None, arena_cap=0) -> Publisher:
+        """Publish a channel. `arena_cap` requests an arena capacity in bytes
+        (0 = broker default, 512 KiB).
+
+        The publisher sizes the arena because the publisher is the side that knows
+        how big its messages are: a message larger than the ring can never be
+        published, and one that fills it stalls until the subscriber has drained
+        every byte. The broker clamps the value to [256 KiB, 128 MiB] and rounds it
+        up to a power of two; :attr:`Publisher.capacity` reports what it got.
+        Requires broker >= 0.9.0.
+        """
+        ring, schema_fp = self._with_reconnect(lambda: self._do_publish(name, schema_json, key, arena_cap))
+        reg = _ChanReg(name, schema_json, key, arena_cap, ring, schema_fp)
         with self._reg_lock:
             self._channels.append(reg)
         return Publisher(self, reg)
@@ -550,6 +616,40 @@ class Connection:
                 except OSError:
                     continue
             rr.push_blocking(frame.encode(proto.FP_RPC_RESPONSE, e.getvalue()), 2000)
+
+    def function_arena_capacity(self, fn_name, key=None) -> int:
+        """Capacity of a function's request arena, as the broker allocated it:
+        what a caller sizes its requests by.
+
+        A request bigger than the arena never fits, and one that fills it leaves
+        no room for anybody else. Costs one control round-trip, so remember the
+        answer rather than asking per call.
+        """
+
+        def op():
+            corr = _new_id()
+            e = avro.Encoder()
+            e.put_long(corr)
+            e.put_long(self._client_id_tx())
+            e.put_string(fn_name)
+            e.put_string(key or "")
+            _, body = self._control_call(proto.FP_LOOKUP, e.getvalue(), corr, 5.0)
+            d = avro.Decoder(body)
+            d.get_long()
+            d.get_long()  # fn_id
+            d.get_long()  # req_fp
+            d.get_long()  # resp_fp
+            arena = d.get_string()
+            status = d.get_int()
+            msg = d.get_string()
+            if status != proto.ST_OK:
+                raise RingError(f"lookup failed: {msg}", status)
+            # The arena's own header is the answer: the broker clamps and rounds
+            # what the service asked for, and both ends read the result from the
+            # same place.
+            return Ring.attach(shm.open_segment(arena), 0).cap
+
+        return self._with_reconnect(op)
 
     def call_async(self, fn_name, req_body, key=None) -> Future:
         """Send an RPC and return a Future resolving to the response body.

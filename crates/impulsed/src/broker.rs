@@ -315,7 +315,18 @@ impl Broker {
       }
     };
     let channel_id = self.reg.alloc_channel_id();
-    let arena = self.make_arena(util::channel_arena(channel_id as u64), control::ARENA_CAP)?;
+    // The publisher sizes its own arena, because the publisher is the one that
+    // knows how big its frames are: a chunked body, an SSE event and a WebSocket
+    // message have nothing in common but the channel they travel on. `0` (and an
+    // older connector, which omits the field) means the default.
+    let arena_cap = control::clamp_arena_cap(m.arena_cap.max(0) as usize);
+    let arena = self.make_arena(util::channel_arena(channel_id as u64), arena_cap)?;
+    if arena_cap != control::ARENA_CAP {
+      // Debug, not info: a server that sizes its stream channels publishes one per
+      // large response, and an operator watching a busy proxy does not need a line
+      // for each.
+      log::debug!("channel '{}' uses a {arena_cap}-byte arena", m.channel);
+    }
     let key = (!m.access_key.is_empty()).then(|| util::key_hash(&m.access_key));
     self.reg.insert_channel(ChannelMeta {
       id: channel_id,

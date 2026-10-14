@@ -37,6 +37,34 @@ ir_free(resp);
 ir_disconnect(c);
 ```
 
+### Ring sizes
+
+Every ring on the bus has a fixed size, and each is sized by the side that knows
+what has to fit through it. The sizes are readable from both ends, so a limit
+derived from one is a limit on the ring the two sides actually share — not a
+constant each hopes the other kept to.
+
+```c
+/* A channel's arena is sized by its publisher: it knows how big its messages
+ * are. The broker clamps to [256 KiB, 128 MiB] and rounds up to a power of two,
+ * and ir_publisher_capacity reports what it actually allocated — a message
+ * bigger than that can never be published, so cut a stream by this. */
+ir_publisher *p = ir_publish_channel_with_arena(c, "files", SCHEMA, NULL, 8u << 20);
+uint64_t chunk = ir_publisher_capacity(p) / 3;  /* three in flight keeps it moving */
+
+/* A connection's reply ring is sized by the caller: every reply arrives through
+ * that one ring (control replies and RPC responses alike), so it is the ceiling
+ * on an answer. Raised to the default (64 KiB) if smaller, capped at 128 MiB,
+ * rounded up to a power of two. */
+ir_conn *cli = ir_connect_with_reply_cap("my-c-client", 4u << 20);
+uint64_t reply = ir_reply_capacity(cli);
+
+/* A function's request arena is sized by the service exposing it, and read by
+ * the caller that writes into it (one control round-trip, so remember it). */
+uint64_t fn_cap = 0;
+ir_function_arena_capacity(cli, "upload", NULL, &fn_cap);
+```
+
 See [`examples/demo.c`](examples/demo.c) for a full publish/subscribe + RPC flow,
 and the public API in [`include/impulse_ring.h`](include/impulse_ring.h).
 

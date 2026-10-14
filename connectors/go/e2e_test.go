@@ -255,3 +255,93 @@ func TestCrossLanguage(t *testing.T) {
 		t.Errorf("rmul(6,7) = %d, want 42", product)
 	}
 }
+
+// TestRingSizes proves the sizes a connector chooses and the ones it reads back:
+// a publisher sizes its channel's arena (the publisher is the side that knows how
+// big its messages are), a caller sizes its own reply ring (only the caller knows
+// how big an answer it is willing to receive), and both ends read the capacity out
+// of the same ring header — which is what makes it sound to derive a message size
+// limit from.
+func TestRingSizes(t *testing.T) {
+	broker := startBroker(t)
+	defer func() {
+		broker.Process.Signal(os.Interrupt)
+		broker.Wait()
+	}()
+
+	svc, err := Connect("go-sizes-svc")
+	if err != nil {
+		t.Fatalf("connect svc: %v", err)
+	}
+	defer svc.Close()
+
+	plain, err := svc.PublishChannel("go-plain", metricSchema, "")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got := plain.Capacity(); got != 512*1024 {
+		t.Errorf("default arena = %d, want 512 KiB", got)
+	}
+	big, err := svc.PublishChannelWithArena("go-big", metricSchema, "", 3*1024*1024)
+	if err != nil {
+		t.Fatalf("publish sized: %v", err)
+	}
+	if got := big.Capacity(); got != 4*1024*1024 {
+		t.Errorf("3 MiB arena = %d, want 4 MiB (clamped up to a power of two)", got)
+	}
+
+	if err := svc.ExposeFunction("go-sizes-add", addReqSchema, addRespSchema, "", addHandler); err != nil {
+		t.Fatalf("expose: %v", err)
+	}
+
+	cli, err := Connect("go-sizes-cli")
+	if err != nil {
+		t.Fatalf("connect cli: %v", err)
+	}
+	defer cli.Close()
+
+	if got := cli.ReplyCapacity(); got != 64*1024 {
+		t.Errorf("default reply ring = %d, want 64 KiB", got)
+	}
+	roomy, err := ConnectWithReplyCap("go-roomy", 1024*1024)
+	if err != nil {
+		t.Fatalf("connect roomy: %v", err)
+	}
+	if got := roomy.ReplyCapacity(); got != 1024*1024 {
+		t.Errorf("roomy reply ring = %d, want 1 MiB", got)
+	}
+	roomy.Close()
+
+	var bigID int64 = -1
+	chans, _ := cli.ListChannels()
+	for _, ch := range chans {
+		if ch.Name == "go-big" {
+			bigID = ch.ChannelID
+		}
+	}
+	if bigID < 0 {
+		t.Fatal("sized channel not listed")
+	}
+	sub, err := cli.Subscribe(bigID, "")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if got, want := sub.Capacity(), big.Capacity(); got != want {
+		t.Errorf("subscriber sees %d, publisher %d — same ring, so they must agree", got, want)
+	}
+	sub.Close()
+
+	cap, err := cli.FunctionArenaCapacity("go-sizes-add", "")
+	if err != nil {
+		t.Fatalf("function arena capacity: %v", err)
+	}
+	if cap != 512*1024 {
+		t.Errorf("default function arena = %d, want 512 KiB", cap)
+	}
+	if _, err := cli.FunctionArenaCapacity("go-nosuch", ""); err == nil {
+		t.Error("looking up a function that does not exist should fail")
+	}
+
+	big.Close()
+	plain.Close()
+}

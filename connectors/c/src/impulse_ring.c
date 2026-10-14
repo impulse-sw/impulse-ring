@@ -34,6 +34,10 @@
 #define CONTROL_NAME "/impulse-ring.ctl.v1"
 #define SUBMISSION_BASE 64u
 #define REPLY_CAP (1u << 16)
+/* The broker's arena bounds, restated: a reply ring is created by this connector
+ * rather than the broker, so nobody else clamps it for us. */
+#define MIN_ARENA_CAP (1ull << 18)
+#define MAX_ARENA_CAP (1ull << 27)
 /* Control superblock: epoch (broker start nanos) at offset 16. It changes on
  * every broker run, so a different value on a freshly opened control segment is
  * the signal that impulsed restarted (see spec/bootstrap.md). */
@@ -61,7 +65,9 @@
 #define FP_REGISTER 0x879b416683ef2068ull
 #define FP_REGISTER_REPLY 0x3af224883f4dec77ull
 #define FP_UNREGISTER 0x82cdc2b7ebd36a6aull
-#define FP_PUBLISH 0xf271a4c7a09fcdd7ull
+/* PublishChannel carries `arena_cap` since 0.9.0; the pre-0.9.0 fingerprint was
+ * 0xf271a4c7a09fcdd7 and a 0.9.0+ broker still accepts it from older clients. */
+#define FP_PUBLISH 0x9ba910d444c0784cull
 #define FP_PUBLISH_REPLY 0x055439d7c0240142ull
 #define FP_LIST 0xa5035910e842f4e6ull
 #define FP_CHANNEL_LIST 0xa1048915e5931da2ull
@@ -687,6 +693,10 @@ typedef struct chan_reg {
   char name[256];
   char *schema_json;
   char *key; /* NULL if none */
+  /* Requested arena capacity, replayed verbatim: a channel that came back from a
+   * broker restart with the default arena would silently reject the messages its
+   * publisher had been sending all along. */
+  uint64_t arena_cap;
   segment arena;
   ring ring;
   uint64_t schema_fp;
@@ -709,6 +719,7 @@ struct ir_conn {
   ring submission;
   segment reply;
   ring reply_ring;
+  uint64_t reply_cap; /* resolved size of the reply ring, replayed on reconnect */
   int64_t client_id;
   int64_t nonce;
   int64_t epoch;
@@ -922,6 +933,21 @@ static void replay_registrations(ir_conn *c);
  * previous control/reply segments are retired (kept mapped) so background loops
  * that copied a ring out of them stay valid until disconnect. Caller must hold
  * reconnect_lock. */
+/* Resolve a requested reply-ring capacity to a legal one: 0 means the default,
+ * anything smaller is raised to it (control replies must fit), anything larger
+ * is capped and rounded up to a power of two, because a ring's capacity must be
+ * one. */
+static uint64_t resolve_reply_cap(uint64_t requested) {
+  if (requested == 0 || requested <= REPLY_CAP)
+    return REPLY_CAP;
+  if (requested > MAX_ARENA_CAP)
+    requested = MAX_ARENA_CAP;
+  uint64_t cap = REPLY_CAP;
+  while (cap < requested)
+    cap <<= 1;
+  return cap;
+}
+
 static int bootstrap_transport(ir_conn *c) {
   segment ctl;
   if (seg_open(CONTROL_NAME, &ctl) != 0)
@@ -940,13 +966,18 @@ static int bootstrap_transport(ir_conn *c) {
   int64_t nonce = rand_i64();
   char reply_name[256];
   snprintf(reply_name, sizeof reply_name, "/impulse-ring.cli.%llu.v1", (unsigned long long)(uint64_t)nonce);
+  /* The reply ring is this connection's own: we create the segment, so we decide
+   * how big a reply we are willing to receive. Kept on the connection so a
+   * reconnect rebuilds the same size — one that came back with the default would
+   * start failing the replies its caller had been getting. */
+  uint32_t reply_cap = (uint32_t)(c->reply_cap ? c->reply_cap : REPLY_CAP);
   segment reply;
-  if (seg_create(reply_name, RING_HEADER + REPLY_CAP, &reply) != 0) {
+  if (seg_create(reply_name, RING_HEADER + reply_cap, &reply) != 0) {
     seg_close(&ctl);
     return IR_ERR;
   }
   ring reply_ring;
-  ring_format(&reply_ring, (uint8_t *)reply.addr, REPLY_CAP);
+  ring_format(&reply_ring, (uint8_t *)reply.addr, reply_cap);
 
   pthread_mutex_lock(&c->tx_lock);
   /* Retire the old segments (still mapped) rather than unmapping them now. */
@@ -1094,6 +1125,7 @@ static void republish_channel(ir_conn *c, chan_reg *cr) {
   ir_avro_put_string(w, cr->name);
   ir_avro_put_string(w, cr->schema_json);
   ir_avro_put_string(w, cr->key ? cr->key : "");
+  ir_avro_put_long(w, (int64_t)cr->arena_cap);
   size_t blen;
   const uint8_t *body = ir_avro_w_bytes(w, &blen);
   uint64_t rfp;
@@ -1216,10 +1248,15 @@ static void *watcher_main(void *arg) {
 }
 
 ir_conn *ir_connect(const char *app_name) {
+  return ir_connect_with_reply_cap(app_name, 0);
+}
+
+ir_conn *ir_connect_with_reply_cap(const char *app_name, uint64_t reply_cap) {
   ir_conn *c = (ir_conn *)calloc(1, sizeof(*c));
   if (!c)
     return NULL;
   snprintf(c->app_name, sizeof c->app_name, "%s", app_name ? app_name : "");
+  c->reply_cap = resolve_reply_cap(reply_cap);
   pthread_mutex_init(&c->tx_lock, NULL);
   pthread_mutex_init(&c->reconnect_lock, NULL);
   pthread_mutex_init(&c->pend_lock, NULL);
@@ -1366,6 +1403,11 @@ void ir_disconnect(ir_conn *c) {
 }
 
 ir_publisher *ir_publish_channel(ir_conn *c, const char *name, const char *schema_json, const char *key) {
+  return ir_publish_channel_with_arena(c, name, schema_json, key, 0);
+}
+
+ir_publisher *ir_publish_channel_with_arena(ir_conn *c, const char *name, const char *schema_json, const char *key,
+                                            uint64_t arena_cap) {
   for (int attempt = 0;; attempt++) {
     int64_t corr = rand_i64();
     ir_avro_w *w = ir_avro_w_new();
@@ -1374,6 +1416,7 @@ ir_publisher *ir_publish_channel(ir_conn *c, const char *name, const char *schem
     ir_avro_put_string(w, name);
     ir_avro_put_string(w, schema_json);
     ir_avro_put_string(w, key ? key : "");
+    ir_avro_put_long(w, (int64_t)arena_cap);
     size_t blen;
     const uint8_t *body = ir_avro_w_bytes(w, &blen);
     uint64_t rfp;
@@ -1409,6 +1452,7 @@ ir_publisher *ir_publish_channel(ir_conn *c, const char *name, const char *schem
     snprintf(cr->name, sizeof cr->name, "%s", name);
     cr->schema_json = strdup(schema_json);
     cr->key = key ? strdup(key) : NULL;
+    cr->arena_cap = arena_cap;
     cr->schema_fp = (uint64_t)schema_fp;
     if (seg_open(arena, &cr->arena) != 0 || ring_attach(&cr->ring, (uint8_t *)cr->arena.addr) != 0) {
       set_err(c, "cannot map channel arena");
@@ -1606,6 +1650,30 @@ uint64_t ir_subscriber_schema_fp(const ir_subscriber *s) {
   return s->schema_fp;
 }
 
+uint64_t ir_subscriber_capacity(const ir_subscriber *s) {
+  return s ? (uint64_t)s->ring.cap : 0;
+}
+
+uint64_t ir_publisher_capacity(const ir_publisher *p) {
+  if (!p)
+    return 0;
+  /* Under `lock` because a reconnect swaps the ring out from under us. */
+  pthread_mutex_lock(&p->reg->lock);
+  uint64_t cap = (uint64_t)p->reg->ring.cap;
+  pthread_mutex_unlock(&p->reg->lock);
+  return cap;
+}
+
+uint64_t ir_reply_capacity(const ir_conn *c) {
+  if (!c)
+    return 0;
+  ir_conn *m = (ir_conn *)c; /* only the mutex is mutated */
+  pthread_mutex_lock(&m->tx_lock);
+  uint64_t cap = (uint64_t)m->reply_ring.cap;
+  pthread_mutex_unlock(&m->tx_lock);
+  return cap;
+}
+
 /* ---- service ---- */
 static ring *caller_ring(service *sv, const char *name) {
   caller_seg *cs = sv->cache;
@@ -1771,6 +1839,60 @@ int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_
     set_err(c, "cannot start service thread");
     return IR_ERR;
   }
+  return IR_OK;
+}
+
+int ir_function_arena_capacity(ir_conn *c, const char *fn_name, const char *key, uint64_t *out) {
+  if (!c || !out)
+    return IR_ERR;
+  int64_t corr = rand_i64();
+  ir_avro_w *w = ir_avro_w_new();
+  ir_avro_put_long(w, corr);
+  ir_avro_put_long(w, client_id_of(c));
+  ir_avro_put_string(w, fn_name);
+  ir_avro_put_string(w, key ? key : "");
+  size_t blen;
+  const uint8_t *body = ir_avro_w_bytes(w, &blen);
+  uint64_t rfp;
+  uint8_t *rbody;
+  size_t rlen;
+  int rc = control_call(c, FP_LOOKUP, body, blen, corr, 5000, &rfp, &rbody, &rlen);
+  ir_avro_w_free(w);
+  if (rc != 0) {
+    set_err(c, "lookup timed out");
+    return IR_ERR_TIMEOUT;
+  }
+  /* LookupReply: corr, fn_id, req_fp, resp_fp, req_arena, status, message */
+  ir_avro_r *r = ir_avro_r_new(rbody, rlen);
+  (void)ir_avro_get_long(r);
+  (void)ir_avro_get_long(r);
+  (void)ir_avro_get_long(r);
+  (void)ir_avro_get_long(r);
+  char *req_arena = ir_avro_get_string(r);
+  int32_t status = ir_avro_get_int(r);
+  char *msg = ir_avro_get_string(r);
+  ir_avro_r_free(r);
+  free(rbody);
+  if (status != ST_OK) {
+    int code = (status == ST_DENIED) ? IR_ERR_DENIED : (status == ST_NOT_FOUND) ? IR_ERR_NOTFOUND : IR_ERR;
+    set_err(c, "lookup failed: %s", msg ? msg : "");
+    free(req_arena);
+    free(msg);
+    return code;
+  }
+  free(msg);
+  /* The arena's own header is the answer: the broker clamps and rounds what the
+   * service asked for, and both ends read the result from the same place. */
+  segment arena;
+  ring fnring;
+  if (seg_open(req_arena, &arena) != 0 || ring_attach(&fnring, (uint8_t *)arena.addr) != 0) {
+    set_err(c, "cannot map function arena");
+    free(req_arena);
+    return IR_ERR;
+  }
+  free(req_arena);
+  *out = (uint64_t)fnring.cap;
+  seg_close(&arena);
   return IR_OK;
 }
 

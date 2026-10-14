@@ -213,18 +213,95 @@ pub const HEADER_SESSION: &str = "x-impulse-ring-session";
 /// live SSE/WebSocket stream.
 pub const HEADER_BODY_CHANNEL: &str = "x-impulse-ring-body-chan";
 
-/// Largest response body the server returns inline through the reply ring.
+/// Numerator of the inline-body share of a ring that **many** records pass
+/// through (a function request ring: several callers at once).
 ///
-/// Kept comfortably under `impulse_ring_core::control::REPLY_CAP` (512 KiB) to
-/// leave room for the status, headers and Avro framing in the same record.
-/// Bodies above this are streamed over a channel named by [`HEADER_BODY_CHANNEL`].
-pub const MAX_INLINE_RESPONSE_BODY: usize = 448 * 1024;
+/// Three eighths. Not "the whole ring minus framing": a ring holds every record
+/// in flight at once, so a request that filled it would make every other caller
+/// wait out `push_blocking` and then fail with `function request ring full`.
+/// Three eighths leaves room for two more such records — and on the default
+/// 512 KiB arena it comes out at exactly the 192 KiB this crate used to hard-code.
+pub const SHARED_NUM: usize = 3;
+/// Denominator of [`SHARED_NUM`].
+pub const SHARED_DEN: usize = 8;
 
-/// Chunk size used when streaming a large body over a body channel.
+/// Numerator of the inline-body share of a ring that **one** record passes
+/// through at a time (a reply ring, from the responder's point of view).
 ///
-/// Kept under `impulse_ring_core::control::ARENA_CAP` (256 KiB) so each frame
-/// fits the channel's data arena with room for framing.
-pub const RESPONSE_BODY_CHUNK: usize = 192 * 1024;
+/// Seven eighths — on the default 512 KiB reply ring, exactly the 448 KiB this
+/// crate used to hard-code. The reply ring is still shared with this client's
+/// control replies, so a caller that routinely receives bodies this size should
+/// ask for a bigger one (`Connection::connect_with_reply_cap`) rather than rely
+/// on the share.
+pub const REPLY_NUM: usize = 7;
+/// Denominator of [`REPLY_NUM`].
+pub const REPLY_DEN: usize = 8;
+
+/// Largest request body that fits inline in a function request ring of
+/// `arena_cap` bytes.
+///
+/// Derived, not assumed: the caller attaches the very ring it is about to write
+/// to (`Connection::function_arena_capacity`), so the limit is a property of what
+/// the two sides share rather than a constant each hopes the other kept to. A
+/// service that exposed its function with a larger arena gets larger inline
+/// requests for free; one that asked for the smallest still gets a limit that
+/// fits.
+pub const fn max_inline_request_body(arena_cap: usize) -> usize {
+  arena_cap * SHARED_NUM / SHARED_DEN
+}
+
+/// Largest response body that fits inline in a reply ring of `reply_cap` bytes.
+///
+/// The responder reads the capacity out of the caller's reply ring, which it
+/// attaches in order to answer at all.
+pub const fn max_inline_response_body(reply_cap: usize) -> usize {
+  reply_cap * REPLY_NUM / REPLY_DEN
+}
+
+/// Chunk size for streaming a body over a channel whose arena holds
+/// `arena_cap` bytes.
+///
+/// Same share as an inline request, and for the same reason: a channel is a ring,
+/// and a frame that filled it would stall the publisher until the subscriber
+/// drained every byte. Three frames in flight is what keeps a stream moving.
+pub const fn body_chunk(arena_cap: usize) -> usize {
+  arena_cap * SHARED_NUM / SHARED_DEN
+}
+
+/// The broker's default ring capacity (`impulse_ring_core::control::ARENA_CAP`
+/// and `REPLY_CAP`, both 512 KiB), restated here as a literal.
+///
+/// Restated rather than imported: this crate is the wire protocol — the records
+/// two ends exchange — and depending on the connector's core to name one number
+/// would tie the protocol to a particular implementation of the bus. The number
+/// is checked against the derived defaults below, so a drift shows up as a failed
+/// assertion rather than as mysteriously chunked bodies.
+pub const DEFAULT_RING_CAP: usize = 512 * 1024;
+
+/// Largest response body the server returns inline through a **default** reply
+/// ring.
+///
+/// What [`max_inline_response_body`] gives for [`DEFAULT_RING_CAP`]. Kept for
+/// callers with no reply ring in hand; one that has it should derive.
+pub const MAX_INLINE_RESPONSE_BODY: usize = max_inline_response_body(DEFAULT_RING_CAP);
+
+/// Chunk size for a body channel of the **default** arena size.
+pub const RESPONSE_BODY_CHUNK: usize = body_chunk(DEFAULT_RING_CAP);
+
+/// Request header carrying the **capacity of the caller's reply ring**, in bytes.
+///
+/// A response travels as one record on the caller's reply ring, so the largest
+/// response that can come back inline is a property of *that* ring — which the
+/// caller owns and sizes, and the responder therefore cannot know. The caller
+/// states it ([`impulse_ring_connector::Connection::reply_capacity`]); the
+/// responder derives its limit with [`max_inline_response_body`] and streams
+/// anything larger over a body channel.
+///
+/// Absent (an older client, or one that does not care), the responder falls back
+/// to [`MAX_INLINE_RESPONSE_BODY`] — the limit of a default-sized reply ring,
+/// which is what it had to assume before. The header is stripped before the
+/// request reaches the HTTP pipeline.
+pub const HEADER_REPLY_CAP: &str = "x-impulse-ring-reply-cap";
 
 /// Request header naming a channel that carries a **streamed request body**.
 ///
@@ -242,25 +319,30 @@ pub const RESPONSE_BODY_CHUNK: usize = 192 * 1024;
 /// This is the request-side mirror of [`HEADER_BODY_CHANNEL`].
 pub const HEADER_REQUEST_BODY_CHANNEL: &str = "x-impulse-ring-req-body-chan";
 
-/// Largest request body the client ships inline through the function request ring.
+/// Largest request body the client ships inline through a **default** function
+/// request ring.
 ///
-/// Kept comfortably under `impulse_ring_core::control::ARENA_CAP` (256 KiB) — the
-/// capacity of a function's request ring — to leave room for the method, uri,
-/// headers and Avro/RPC framing in the same record. Bodies above this are streamed
-/// over a channel named by [`HEADER_REQUEST_BODY_CHANNEL`]. Mirrors
-/// [`MAX_INLINE_RESPONSE_BODY`] on the request side.
-pub const MAX_INLINE_REQUEST_BODY: usize = 192 * 1024;
+/// What [`max_inline_request_body`] gives for [`DEFAULT_RING_CAP`].
+pub const MAX_INLINE_REQUEST_BODY: usize = max_inline_request_body(DEFAULT_RING_CAP);
 
-/// Chunk size used when streaming a large request body over a body channel.
-///
-/// Kept under `impulse_ring_core::control::ARENA_CAP` (256 KiB) so each frame fits
-/// the channel's data arena with room for framing. Mirrors [`RESPONSE_BODY_CHUNK`].
-pub const REQUEST_BODY_CHUNK: usize = 192 * 1024;
+/// Chunk size for streaming a large request body over a body channel of the
+/// **default** arena size.
+pub const REQUEST_BODY_CHUNK: usize = body_chunk(DEFAULT_RING_CAP);
 
-// The inline ceiling and the streaming chunk must both fit a 256 KiB arena with
-// framing headroom (the smallest configurable request arena, `MIN_ARENA_CAP`).
-const _: () = assert!(MAX_INLINE_REQUEST_BODY <= 256 * 1024);
-const _: () = assert!(REQUEST_BODY_CHUNK <= 256 * 1024);
+/// The smallest arena the broker will allocate (`MIN_ARENA_CAP`), restated for
+/// the same reason as [`DEFAULT_RING_CAP`].
+pub const MIN_RING_CAP: usize = 256 * 1024;
+
+// Whatever share is chosen, both must fit the smallest arena the broker will
+// allocate — a service may ask for it and get it.
+const _: () = assert!(max_inline_request_body(MIN_RING_CAP) < MIN_RING_CAP);
+const _: () = assert!(body_chunk(MIN_RING_CAP) < MIN_RING_CAP);
+// And the derived defaults must be exactly what this crate hard-coded before,
+// so nothing downstream shifts by the mere act of deriving them.
+const _: () = assert!(MAX_INLINE_REQUEST_BODY == 192 * 1024);
+const _: () = assert!(MAX_INLINE_RESPONSE_BODY == 448 * 1024);
+const _: () = assert!(REQUEST_BODY_CHUNK == 192 * 1024);
+const _: () = assert!(RESPONSE_BODY_CHUNK == 192 * 1024);
 
 /// Prefix for channels carrying HTTP-over-Ring stream data.
 pub const STREAM_CHAN_PREFIX: &str = "impulse-ring-http/v1/stream/";
@@ -351,6 +433,31 @@ pub const STREAM_SCHEMA: &str = r#"{
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Доли считаются от кольца, а умолчания остаются теми же числами.
+  ///
+  /// Проверяется обе половины сразу: смысл правки — чтобы предел зависел от
+  /// кольца, которое две стороны и так делят, и чтобы при этом ни у кого
+  /// ничего не поехало на умолчании.
+  #[test]
+  fn shares_scale_with_the_ring_and_keep_the_old_defaults() {
+    assert_eq!(MAX_INLINE_REQUEST_BODY, 192 * 1024);
+    assert_eq!(MAX_INLINE_RESPONSE_BODY, 448 * 1024);
+    assert_eq!(REQUEST_BODY_CHUNK, 192 * 1024);
+    assert_eq!(RESPONSE_BODY_CHUNK, 192 * 1024);
+
+    // Вдвое большее кольцо — вдвое больший предел.
+    assert_eq!(
+      max_inline_request_body(2 * DEFAULT_RING_CAP),
+      2 * MAX_INLINE_REQUEST_BODY
+    );
+    assert_eq!(body_chunk(64 * 1024 * 1024), 24 * 1024 * 1024);
+
+    // Наименьшая арена, которую выдаёт брокер: предел в неё влезает с запасом
+    // на обвязку, и кадр тоже.
+    assert!(max_inline_request_body(MIN_RING_CAP) < MIN_RING_CAP);
+    assert!(body_chunk(MIN_RING_CAP) < MIN_RING_CAP);
+  }
 
   #[test]
   fn fn_name_is_prefixed() {

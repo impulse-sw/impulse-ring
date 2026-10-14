@@ -54,7 +54,22 @@ typedef int (*ir_handler)(const uint8_t *req, size_t req_len, uint8_t **resp, si
 
 /* Connect to the broker and register `app_name`. Returns NULL on failure. */
 ir_conn *ir_connect(const char *app_name);
+
+/* As ir_connect, but sizes this connection's reply ring at `reply_cap` bytes
+ * (0 = the connector default, 64 KiB).
+ *
+ * Every reply to this connection travels through that one ring — control replies
+ * and RPC responses alike — so it is the ceiling on a response: a function whose
+ * answer does not fit fails to deliver it. A client that calls functions with
+ * large responses asks for a bigger ring here. The value is raised to the
+ * default if smaller, capped at 128 MiB, and rounded up to a power of two (a
+ * ring's capacity must be one); ir_reply_capacity reports what it got. */
+ir_conn *ir_connect_with_reply_cap(const char *app_name, uint64_t reply_cap);
+
 void ir_disconnect(ir_conn *c);
+
+/* Bytes of data region this connection's reply ring holds. */
+uint64_t ir_reply_capacity(const ir_conn *c);
 
 /* Last human-readable error for the connection (never NULL). */
 const char *ir_last_error(ir_conn *c);
@@ -82,9 +97,26 @@ void ir_free(void *p);
 /* Publish a channel. `key` may be NULL for a public channel. NULL on failure. */
 ir_publisher *ir_publish_channel(ir_conn *c, const char *name, const char *schema_json, const char *key);
 
+/* As ir_publish_channel, but requests an arena capacity of `arena_cap` bytes
+ * (0 = broker default, 512 KiB).
+ *
+ * The publisher sizes the arena because the publisher is the side that knows how
+ * big its messages are: a message larger than the ring can never be published,
+ * and one that fills it stalls until the subscriber has drained every byte. The
+ * broker clamps the value to [256 KiB, 128 MiB] and rounds it up to a power of
+ * two; ir_publisher_capacity reports what it got. Requires broker >= 0.9.0. */
+ir_publisher *ir_publish_channel_with_arena(ir_conn *c, const char *name, const char *schema_json, const char *key,
+                                            uint64_t arena_cap);
+
 /* Publish one Avro-encoded message. Returns IR_OK or a negative code. */
 int ir_publish(ir_publisher *p, const uint8_t *avro_body, size_t len);
 void ir_publisher_free(ir_publisher *p);
+
+/* Bytes of data region the channel's arena holds, as the broker allocated it
+ * (clamped and rounded, so not necessarily what was requested). A frame bigger
+ * than this cannot be published at all, so a publisher that cuts a stream into
+ * frames sizes them from this. */
+uint64_t ir_publisher_capacity(const ir_publisher *p);
 
 /* List channels into `out` (capacity `max`); writes the count to `*count`. */
 int ir_list_channels(ir_conn *c, ir_channel_info *out, size_t max, size_t *count);
@@ -100,6 +132,10 @@ void ir_subscriber_free(ir_subscriber *s);
 /* The channel's schema fingerprint as reported by the broker. */
 uint64_t ir_subscriber_schema_fp(const ir_subscriber *s);
 
+/* Bytes of data region the subscribed channel's arena holds. Both ends read it
+ * out of the same ring header, so neither has to assume what the other kept to. */
+uint64_t ir_subscriber_capacity(const ir_subscriber *s);
+
 /* ---- functions / RPC ---- */
 
 /* Expose a function served by `handler` on a background thread, using the
@@ -113,6 +149,14 @@ int ir_expose_function(ir_conn *c, const char *name, const char *req_schema_json
 int ir_expose_function_with_arena(ir_conn *c, const char *name, const char *req_schema_json,
                                   const char *resp_schema_json, const char *key, uint64_t req_arena_cap,
                                   ir_handler handler, void *user);
+
+/* Capacity of a function's request arena, as the broker allocated it, written to
+ * `*out`. Returns IR_OK, or a negative code if the function cannot be looked up.
+ *
+ * What a caller sizes its requests by: a request bigger than the arena never
+ * fits, and one that fills it leaves no room for anybody else. Costs one control
+ * round-trip, so remember the answer rather than asking per call. */
+int ir_function_arena_capacity(ir_conn *c, const char *fn_name, const char *key, uint64_t *out);
 
 /* Call a remote function and block for the response. On success returns IR_OK
  * with `*resp`/`*resp_len` set (owned by caller). */

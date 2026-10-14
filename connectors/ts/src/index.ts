@@ -25,17 +25,23 @@ const { i32, i64, u64, ptr: PTR, cstring, void: VOID } = FFIType;
 
 const lib = dlopen(LIB, {
   ir_connect: { args: [cstring], returns: PTR },
+  ir_connect_with_reply_cap: { args: [cstring, u64], returns: PTR },
+  ir_reply_capacity: { args: [PTR], returns: u64 },
   ir_disconnect: { args: [PTR], returns: VOID },
   ir_last_error: { args: [PTR], returns: cstring },
   ir_free: { args: [PTR], returns: VOID },
   ir_publish_channel: { args: [PTR, cstring, cstring, cstring], returns: PTR },
+  ir_publish_channel_with_arena: { args: [PTR, cstring, cstring, cstring, u64], returns: PTR },
   ir_publish: { args: [PTR, PTR, u64], returns: i32 },
   ir_publisher_free: { args: [PTR], returns: VOID },
+  ir_publisher_capacity: { args: [PTR], returns: u64 },
   ir_list_channels: { args: [PTR, PTR, u64, PTR], returns: i32 },
   ir_subscribe: { args: [PTR, i64, cstring], returns: PTR },
   ir_recv: { args: [PTR, i32, PTR, PTR], returns: i32 },
   ir_subscriber_free: { args: [PTR], returns: VOID },
+  ir_subscriber_capacity: { args: [PTR], returns: u64 },
   ir_call: { args: [PTR, cstring, cstring, PTR, u64, i32, PTR, PTR], returns: i32 },
+  ir_function_arena_capacity: { args: [PTR, cstring, cstring, PTR], returns: i32 },
   ir_broker_epoch: { args: [PTR], returns: i64 },
   ir_broker_restarted: { args: [PTR], returns: i32 },
   ir_set_auto_reconnect: { args: [PTR, i32], returns: VOID },
@@ -72,6 +78,13 @@ export class Publisher {
     const rc = S.ir_publish(this.handle, ptr(body), BigInt(body.length));
     if (rc !== IR_OK) throw new RingError("publish failed");
   }
+  // Bytes of data region the channel's arena holds, as the broker allocated it
+  // (clamped and rounded, so not necessarily what was asked for). A message
+  // bigger than this can never be published, so a publisher that cuts a stream
+  // into messages sizes them from here.
+  capacity(): number {
+    return Number(S.ir_publisher_capacity(this.handle));
+  }
   close(): void {
     S.ir_publisher_free(this.handle);
   }
@@ -92,6 +105,11 @@ export class Subscriber {
     S.ir_free(p);
     return out;
   }
+  // Bytes of data region the channel's arena holds. Both ends read it out of the
+  // same ring header, so neither has to assume what the other kept to.
+  capacity(): number {
+    return Number(S.ir_subscriber_capacity(this.handle));
+  }
   close(): void {
     S.ir_subscriber_free(this.handle);
   }
@@ -100,9 +118,20 @@ export class Subscriber {
 export class Connection {
   private handle: number | bigint;
 
-  constructor(appName: string) {
-    this.handle = S.ir_connect(cstr(appName));
+  // `replyCap` sizes this connection's reply ring in bytes (0 = the connector
+  // default, 64 KiB). Every reply travels through that one ring — control
+  // replies and RPC responses alike — so it is the ceiling on a response: a
+  // function whose answer does not fit fails to deliver it. The value is raised
+  // to the default if smaller, capped at 128 MiB, and rounded up to a power of
+  // two (a ring's capacity must be one).
+  constructor(appName: string, replyCap = 0) {
+    this.handle = S.ir_connect_with_reply_cap(cstr(appName), BigInt(replyCap));
     if (!this.handle) throw new RingError("connect failed (is impulsed running?)");
+  }
+
+  // Bytes of data region this connection's reply ring holds.
+  replyCapacity(): number {
+    return Number(S.ir_reply_capacity(this.handle));
   }
 
   private err(prefix: string): RingError {
@@ -117,10 +146,30 @@ export class Connection {
     }
   }
 
-  publishChannel(name: string, schemaJson: string, key = ""): Publisher {
-    const h = S.ir_publish_channel(this.handle, cstr(name), cstr(schemaJson), key ? cstr(key) : null);
+  // `arenaCap` requests an arena capacity in bytes (0 = broker default, 512
+  // KiB): the publisher sizes it, because the publisher is the side that knows
+  // how big its messages are. The broker clamps it to [256 KiB, 128 MiB] and
+  // rounds up to a power of two; Publisher.capacity reports what it got.
+  publishChannel(name: string, schemaJson: string, key = "", arenaCap = 0): Publisher {
+    const h = S.ir_publish_channel_with_arena(
+      this.handle,
+      cstr(name),
+      cstr(schemaJson),
+      key ? cstr(key) : null,
+      BigInt(arenaCap),
+    );
     if (!h) throw this.err("publishChannel");
     return new Publisher(h);
+  }
+
+  // Capacity of a function's request arena, as the broker allocated it: what a
+  // caller sizes its requests by. Costs one control round-trip, so remember the
+  // answer rather than asking per call.
+  functionArenaCapacity(fnName: string, key = ""): number {
+    const out = new BigUint64Array(1);
+    const rc = S.ir_function_arena_capacity(this.handle, cstr(fnName), key ? cstr(key) : null, ptr(out));
+    if (rc !== IR_OK) throw this.err("functionArenaCapacity");
+    return Number(out[0]);
   }
 
   listChannels(max = 64): ChannelInfo[] {

@@ -48,6 +48,19 @@ schema JSON and use the returned fingerprints.
   the C library (JS can't mmap/atomics in pure JS). Client surface
   (publish/subscribe/call); TS↔Rust test.
 
+Every connector sizes the rings it owns and reads back the sizes it does not:
+`publish_channel` takes an arena capacity (the publisher knows how big its
+messages are), `connect` takes a reply-ring capacity (only the caller knows how
+big an answer it will accept), and the capacity of a channel arena, a reply ring
+and a function's request arena is readable from either end. See each connector's
+README under **Ring sizes**.
+
+A connector of 0.9.0 or later needs a broker of 0.9.0 or later: `PublishChannel`
+grew the `arena_cap` field, so its fingerprint changed. The reverse direction
+keeps working — a 0.9.0+ broker still accepts the pre-0.9.0 record from an
+unupgraded connector (see the legacy table in
+[spec/schemas/FINGERPRINTS.md](spec/schemas/FINGERPRINTS.md)).
+
 New to writing schemas? See **[spec/authoring-schemas.md](spec/authoring-schemas.md)**
 for how to describe messages and functions in Avro.
 

@@ -8,7 +8,12 @@ import "fmt"
 const (
 	controlName    = "/impulse-ring.ctl.v1"
 	submissionBase = 64
-	replyCap       = 1 << 16
+	// replyCap is the default size of a connection's reply ring. The connector
+	// creates that segment itself, so nobody else clamps it: see
+	// ConnectWithReplyCap and resolveReplyCap.
+	replyCap = 1 << 16
+	// maxArenaCap is the broker's own ceiling, restated for the reply ring.
+	maxArenaCap = 1 << 27
 	// ctlEpochOff is the offset of the broker epoch (8 bytes) in the control
 	// superblock. It changes on every broker run, so a different value on a
 	// freshly opened control segment means impulsed restarted (spec/bootstrap.md).
@@ -21,7 +26,9 @@ const (
 	fpRegister      = 0x879B416683EF2068
 	fpRegisterReply = 0x3AF224883F4DEC77
 	fpUnregister    = 0x82CDC2B7EBD36A6A
-	fpPublish       = 0xF271A4C7A09FCDD7
+	// PublishChannel carries arena_cap since 0.9.0; the pre-0.9.0 fingerprint was
+	// 0xF271A4C7A09FCDD7 and a 0.9.0+ broker still accepts it from older clients.
+	fpPublish       = 0x9BA910D444C0784C
 	fpPublishReply  = 0x055439D7C0240142
 	fpList          = 0xA5035910E842F4E6
 	fpChannelList   = 0xA1048915E5931DA2

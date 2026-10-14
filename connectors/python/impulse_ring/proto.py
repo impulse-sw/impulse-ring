@@ -6,7 +6,11 @@ since control schemas are fixed, the frame's fingerprint identifies the message.
 CONTROL_NAME = "/impulse-ring.ctl.v1"
 CTL_MAGIC = b"IMPRING\x00"
 SUBMISSION_BASE = 64
+# Default size of a connection's reply ring. The connector creates that segment
+# itself, so nobody else clamps it: see Connection(reply_cap=...).
 REPLY_CAP = 1 << 16
+# The broker's own arena ceiling, restated for the reply ring.
+MAX_ARENA_CAP = 1 << 27
 # Offset of the broker epoch (8 bytes) in the control superblock. It changes on
 # every broker run, so a different value on a freshly opened control segment
 # means impulsed restarted (see spec/bootstrap.md).
@@ -16,7 +20,9 @@ CTL_OFF_EPOCH = 16
 FP_REGISTER = 0x879B416683EF2068
 FP_REGISTER_REPLY = 0x3AF224883F4DEC77
 FP_UNREGISTER = 0x82CDC2B7EBD36A6A
-FP_PUBLISH = 0xF271A4C7A09FCDD7
+# PublishChannel carries `arena_cap` since 0.9.0; the pre-0.9.0 fingerprint was
+# 0xF271A4C7A09FCDD7 and a 0.9.0+ broker still accepts it from older clients.
+FP_PUBLISH = 0x9BA910D444C0784C
 FP_PUBLISH_REPLY = 0x055439D7C0240142
 FP_LIST = 0xA5035910E842F4E6
 FP_CHANNEL_LIST = 0xA1048915E5931DA2

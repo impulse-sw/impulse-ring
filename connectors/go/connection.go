@@ -36,9 +36,13 @@ type chanReg struct {
 	name       string
 	schemaJSON string
 	key        string
-	seg        *segment
-	r          *ring
-	schemaFP   uint64
+	// arenaCap is the requested arena capacity, replayed verbatim: a channel that
+	// came back from a broker restart with the default arena would silently
+	// reject the messages its publisher had been sending all along.
+	arenaCap int64
+	seg      *segment
+	r        *ring
+	schemaFP uint64
 }
 
 // svcReg is an exposed function, tracked so it can be replayed after a restart.
@@ -68,9 +72,12 @@ type Connection struct {
 	replySeg  *segment
 	replyRing *ring
 	replyName string
-	clientID  int64
-	nonce     int64
-	epoch     int64
+	// replyCap is the resolved reply-ring size, kept so a reconnect rebuilds the
+	// same ring rather than falling back to the default.
+	replyCap int
+	clientID int64
+	nonce    int64
+	epoch    int64
 
 	mu      sync.Mutex
 	pending map[int64]chan reply
@@ -109,7 +116,20 @@ func randID() int64 {
 
 // Connect attaches to the broker and registers appName on the bus.
 func Connect(appName string) (*Connection, error) {
-	c := &Connection{appName: appName, pending: make(map[int64]chan reply)}
+	return ConnectWithReplyCap(appName, 0)
+}
+
+// ConnectWithReplyCap attaches to the broker with a reply ring of replyCap bytes
+// (0 = the connector default, 64 KiB).
+//
+// Every reply to this connection travels through that one ring — control replies
+// and RPC responses alike — so it is the ceiling on a response: a function whose
+// answer does not fit fails to deliver it. A client that calls functions with
+// large responses asks for a bigger ring here. The value is raised to the default
+// if smaller, capped at 128 MiB, and rounded up to a power of two (a ring's
+// capacity must be one); ReplyCapacity reports what it got.
+func ConnectWithReplyCap(appName string, replyCapBytes int) (*Connection, error) {
+	c := &Connection{appName: appName, replyCap: resolveReplyCap(replyCapBytes), pending: make(map[int64]chan reply)}
 	c.running.Store(true)
 	c.autoReconnect.Store(true)
 
@@ -151,12 +171,18 @@ func (c *Connection) bootstrap() error {
 
 	nonce := randID()
 	replyName := fmt.Sprintf("/impulse-ring.cli.%d.v1", nonce)
-	replySeg, err := segCreate(replyName, ringBytes(replyCap))
+	// The reply ring is this connection's own: we create the segment, so we decide
+	// how big a reply we are willing to receive.
+	cap := c.replyCap
+	if cap == 0 {
+		cap = replyCap
+	}
+	replySeg, err := segCreate(replyName, ringBytes(cap))
 	if err != nil {
 		ctl.close()
 		return err
 	}
-	replyRing := ringFormat(replySeg.data, 0, replyCap)
+	replyRing := ringFormat(replySeg.data, 0, cap)
 
 	c.txMu.Lock()
 	if c.ctl != nil {
@@ -384,7 +410,7 @@ func (c *Connection) replay() {
 	c.regMu.Unlock()
 
 	for _, cr := range chans {
-		seg, rr, fp, err := c.doPublish(cr.name, cr.schemaJSON, cr.key)
+		seg, rr, fp, err := c.doPublish(cr.name, cr.schemaJSON, cr.key, cr.arenaCap)
 		if err != nil {
 			continue
 		}
@@ -439,8 +465,33 @@ func (c *Connection) Close() {
 	c.ctl.close()
 }
 
+// resolveReplyCap turns a requested reply-ring size into a legal one: 0 means the
+// default, anything smaller is raised to it (control replies must fit), anything
+// larger is capped and rounded up to a power of two.
+func resolveReplyCap(requested int) int {
+	if requested <= replyCap {
+		return replyCap
+	}
+	if requested > maxArenaCap {
+		requested = maxArenaCap
+	}
+	cap := replyCap
+	for cap < requested {
+		cap <<= 1
+	}
+	return cap
+}
+
+// ReplyCapacity returns the bytes of data region this connection's reply ring
+// holds.
+func (c *Connection) ReplyCapacity() int {
+	c.txMu.RLock()
+	defer c.txMu.RUnlock()
+	return int(c.replyRing.cap)
+}
+
 // doPublish performs the PublishChannel round-trip and attaches the arena ring.
-func (c *Connection) doPublish(name, schemaJSON, key string) (*segment, *ring, uint64, error) {
+func (c *Connection) doPublish(name, schemaJSON, key string, arenaCap int64) (*segment, *ring, uint64, error) {
 	corr := randID()
 	e := NewEncoder()
 	e.PutLong(corr)
@@ -448,6 +499,7 @@ func (c *Connection) doPublish(name, schemaJSON, key string) (*segment, *ring, u
 	e.PutString(name)
 	e.PutString(schemaJSON)
 	e.PutString(key)
+	e.PutLong(arenaCap)
 	r, err := c.controlCall(fpPublish, e.Bytes(), corr, 5000)
 	if err != nil {
 		return nil, nil, 0, err
@@ -477,12 +529,24 @@ func (c *Connection) doPublish(name, schemaJSON, key string) (*segment, *ring, u
 // PublishChannel publishes a channel with the given Avro schema. key may be ""
 // for a public channel.
 func (c *Connection) PublishChannel(name, schemaJSON, key string) (*Publisher, error) {
+	return c.PublishChannelWithArena(name, schemaJSON, key, 0)
+}
+
+// PublishChannelWithArena publishes a channel, requesting an arena capacity of
+// arenaCap bytes (0 = broker default, 512 KiB).
+//
+// The publisher sizes the arena because the publisher is the side that knows how
+// big its messages are: a message larger than the ring can never be published,
+// and one that fills it stalls until the subscriber has drained every byte. The
+// broker clamps the value to [256 KiB, 128 MiB] and rounds it up to a power of
+// two; Publisher.Capacity reports what it got. Requires broker >= 0.9.0.
+func (c *Connection) PublishChannelWithArena(name, schemaJSON, key string, arenaCap int64) (*Publisher, error) {
 	reg, err := withReconnect(c, func() (*chanReg, error) {
-		seg, rr, fp, e := c.doPublish(name, schemaJSON, key)
+		seg, rr, fp, e := c.doPublish(name, schemaJSON, key, arenaCap)
 		if e != nil {
 			return nil, e
 		}
-		return &chanReg{name: name, schemaJSON: schemaJSON, key: key, seg: seg, r: rr, schemaFP: fp}, nil
+		return &chanReg{name: name, schemaJSON: schemaJSON, key: key, arenaCap: arenaCap, seg: seg, r: rr, schemaFP: fp}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -503,6 +567,16 @@ func (p *Publisher) Publish(body []byte) error {
 		return errf("channel full (slow subscriber)")
 	}
 	return nil
+}
+
+// Capacity returns the bytes of data region the channel's arena holds, as the
+// broker allocated it (clamped and rounded, so not necessarily what was asked
+// for). A message bigger than this can never be published, so a publisher that
+// cuts a stream into messages sizes them from here.
+func (p *Publisher) Capacity() int {
+	p.reg.mu.Lock()
+	defer p.reg.mu.Unlock()
+	return int(p.reg.r.cap)
 }
 
 // Close releases the publisher's mapping and stops it being replayed.
@@ -619,6 +693,11 @@ func (s *Subscriber) Recv(timeoutMs int) ([]byte, error) {
 }
 
 // Close releases the subscriber's mapping.
+// Capacity returns the bytes of data region the channel's arena holds. Both ends
+// read it out of the same ring header, so neither has to assume what the other
+// kept to.
+func (s *Subscriber) Capacity() int { return int(s.r.cap) }
+
 func (s *Subscriber) Close() { s.seg.close() }
 
 // ExposeFunction serves name with handler on a background goroutine, using the
@@ -767,6 +846,49 @@ func (c *Connection) serve(sv *svcReg) {
 func (c *Connection) Call(fnName, key string, req []byte, timeoutMs int) ([]byte, error) {
 	return withReconnect(c, func() ([]byte, error) {
 		return c.callOnce(fnName, key, req, timeoutMs)
+	})
+}
+
+// FunctionArenaCapacity returns the capacity of a function's request arena, as
+// the broker allocated it: what a caller sizes its requests by. A request bigger
+// than the arena never fits, and one that fills it leaves no room for anybody
+// else. Costs one control round-trip, so remember the answer rather than asking
+// per call.
+func (c *Connection) FunctionArenaCapacity(fnName, key string) (int, error) {
+	return withReconnect(c, func() (int, error) {
+		corr := randID()
+		e := NewEncoder()
+		e.PutLong(corr)
+		e.PutLong(c.clientId())
+		e.PutString(fnName)
+		e.PutString(key)
+		r, err := c.controlCall(fpLookup, e.Bytes(), corr, 5000)
+		if err != nil {
+			return 0, err
+		}
+		d := NewDecoder(r.body)
+		d.Long()
+		d.Long() // fn_id
+		d.Long() // req_fp
+		d.Long() // resp_fp
+		arena := d.String()
+		status := d.Int()
+		msg := d.String()
+		if status != stOK {
+			return 0, errf("lookup failed: %s", msg)
+		}
+		// The arena's own header is the answer: the broker clamps and rounds what
+		// the service asked for, and both ends read the result from the same place.
+		seg, err := segOpen(arena)
+		if err != nil {
+			return 0, err
+		}
+		defer seg.close()
+		rr, err := ringAttach(seg.data, 0)
+		if err != nil {
+			return 0, err
+		}
+		return int(rr.cap), nil
 	})
 }
 

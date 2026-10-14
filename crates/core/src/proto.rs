@@ -100,6 +100,18 @@ pub struct PublishChannel {
   pub channel: String,
   pub schema_json: String,
   pub access_key: String,
+  /// Requested arena capacity in bytes; `0` means the broker default.
+  ///
+  /// A channel carries a stream — chunked HTTP bodies, SSE, WebSocket frames —
+  /// and how big a frame may be follows from how big its arena is. Until this
+  /// field existed, every channel got [`ARENA_CAP`](crate::control::ARENA_CAP),
+  /// so a publisher with large frames had to cut them to fit a size it could not
+  /// influence.
+  ///
+  /// Added after v1; an older connector omits it and the broker fills `0` here
+  /// via `#[serde(default)]` (see [`legacy_schemas`]), i.e. keeps the default.
+  #[serde(default)]
+  pub arena_cap: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -266,7 +278,7 @@ fn schema_for(kind: Kind) -> &'static str {
     ),
     Kind::PublishChannel => schema_json!(
       "PublishChannel",
-      r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"channel","type":"string"},{"name":"schema_json","type":"string"},{"name":"access_key","type":"string"}"#
+      r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"channel","type":"string"},{"name":"schema_json","type":"string"},{"name":"access_key","type":"string"},{"name":"arena_cap","type":"long","default":0}"#
     ),
     Kind::PublishReply => schema_json!(
       "PublishReply",
@@ -337,6 +349,14 @@ fn legacy_schemas() -> &'static [(Kind, &'static str)] {
       schema_json!(
         "Register",
         r#"{"name":"correlation_id","type":"long"},{"name":"app_name","type":"string"},{"name":"nonce","type":"long"},{"name":"reply_segment","type":"string"},{"name":"heartbeat_ms","type":"long"}"#
+      ),
+    ),
+    (
+      // PublishChannel v1: before the per-channel `arena_cap` field.
+      Kind::PublishChannel,
+      schema_json!(
+        "PublishChannel",
+        r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"channel","type":"string"},{"name":"schema_json","type":"string"},{"name":"access_key","type":"string"}"#
       ),
     ),
     (

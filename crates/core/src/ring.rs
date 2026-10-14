@@ -103,6 +103,17 @@ impl Ring {
     })
   }
 
+  /// Bytes of data region this ring holds, as its header declares.
+  ///
+  /// Readable by *both* ends: the creator passed it to [`Ring::format`], and an
+  /// attacher takes it out of the header. That is what makes it a sound basis for
+  /// a size limit — a limit derived from it is derived from the ring the two
+  /// sides actually share, rather than from a constant each side assumes the
+  /// other kept to.
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
   fn magic_word(&self) -> &AtomicU32 {
     unsafe { self.seg.atomic_u32_at(self.base + OFF_MAGIC) }
   }

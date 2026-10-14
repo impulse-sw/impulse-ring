@@ -272,7 +272,40 @@ fn full_flow_pubsub_and_rpc() {
       )
       .expect("1 MiB arg fits a 4 MiB request arena");
     assert_eq!(ok.len, blob.len() as i64);
+
+    // Per-channel arena: the publisher sizes it, because the publisher is the
+    // one that knows how big its frames are. Unasked, a channel keeps the
+    // broker's default — and what either side derives from the arena, it must
+    // derive from what the broker actually allocated (clamped, rounded up to a
+    // power of two), not from what was asked for.
+    let sized = svc
+      .publish_channel_with_arena("metrics.big", METRIC_SCHEMA, None, 3 * 1024 * 1024)
+      .expect("publish a sized channel");
+    assert_eq!(sized.capacity(), 4 * 1024 * 1024, "3 MiB rounds up to 4");
+    let plain = svc
+      .publish_channel("metrics.plain", METRIC_SCHEMA, None)
+      .expect("publish an unsized channel");
+    assert_eq!(plain.capacity(), 512 * 1024, "unasked keeps the default");
+
+    // And the capacity of a function's request arena is readable by the side
+    // that writes into it: that is what makes a size limit derived rather than
+    // assumed.
+    assert_eq!(
+      client
+        .function_arena_capacity("blob.big", None)
+        .expect("arena capacity"),
+      4 * 1024 * 1024
+    );
   } // connections dropped here -> reply segments unlinked, threads joined
+
+  // Per-connection reply ring: every reply to a connection travels through one
+  // ring, so a caller that expects large responses says so at connect time.
+  {
+    let plain = Connection::connect("reply-default").expect("connect");
+    assert_eq!(plain.reply_capacity(), 512 * 1024, "unasked keeps the default");
+    let roomy = Connection::connect_with_reply_cap("reply-roomy", 8 * 1024 * 1024).expect("connect");
+    assert_eq!(roomy.reply_capacity(), 8 * 1024 * 1024);
+  }
 
   // Regression: once the owner of "metrics"/"add" has left (unregistered above),
   // a fresh app must be able to re-publish the same channel and re-expose the

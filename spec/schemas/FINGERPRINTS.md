@@ -5,7 +5,7 @@
 | `Register` | `0x879b416683ef2068` |
 | `RegisterReply` | `0x3af224883f4dec77` |
 | `Unregister` | `0x82cdc2b7ebd36a6a` |
-| `PublishChannel` | `0xf271a4c7a09fcdd7` |
+| `PublishChannel` | `0x9ba910d444c0784c` |
 | `PublishReply` | `0x055439d7c0240142` |
 | `ListChannels` | `0xa5035910e842f4e6` |
 | `ChannelList` | `0xa1048915e5931da2` |
@@ -29,3 +29,4 @@ serve not-yet-upgraded connectors.
 |---------|--------------------|---------------|
 | `Register` (pre-`pid`) | `0xfc723bd7afcffc02` | added `pid` (`long`, default `0`) |
 | `ExposeFunction` (pre-`req_arena_cap`) | `0xa1acec8abc87f374` | added `req_arena_cap` (`long`, default `0`) |
+| `PublishChannel` (pre-`arena_cap`) | `0xf271a4c7a09fcdd7` | added `arena_cap` (`long`, default `0`) |

@@ -148,6 +148,41 @@ int main(void) {
   CHECK(crc2 == IR_ERR_DENIED, "rpc wrong key denied");
   ir_avro_w_free(aw2);
 
+  /* Ring sizes: the publisher sizes its channel's arena, the caller sizes its own
+   * reply ring, and both ends read back what the broker actually allocated —
+   * which is what makes it sound to derive a message size limit from. */
+  CHECK(ir_publisher_capacity(pub) == (512u << 10), "default channel arena is 512 KiB");
+  ir_publisher *big = ir_publish_channel_with_arena(svc, "c-metrics-big", METRIC_SCHEMA, NULL, 3u << 20);
+  CHECK(big != NULL, "publish a sized channel");
+  CHECK(ir_publisher_capacity(big) == (4u << 20), "3 MiB arena rounds up to 4 MiB");
+  if (big) {
+    int64_t big_id = -1;
+    size_t bn = 0;
+    ir_list_channels(cli, chans, 32, &bn);
+    for (size_t i = 0; i < bn; i++)
+      if (strcmp(chans[i].name, "c-metrics-big") == 0)
+        big_id = chans[i].channel_id;
+    ir_subscriber *bs = ir_subscribe(cli, big_id, NULL);
+    CHECK(bs != NULL, "subscribe to the sized channel");
+    /* Both ends read the same ring header, so they cannot disagree. */
+    CHECK(bs && ir_subscriber_capacity(bs) == ir_publisher_capacity(big), "subscriber sees the same arena");
+    ir_subscriber_free(bs);
+    ir_publisher_free(big);
+  }
+
+  CHECK(ir_reply_capacity(cli) == (1u << 16), "default reply ring is 64 KiB");
+  ir_conn *roomy = ir_connect_with_reply_cap("c-roomy", 1u << 20);
+  CHECK(roomy != NULL, "connect with a roomy reply ring");
+  if (roomy) {
+    CHECK(ir_reply_capacity(roomy) == (1u << 20), "reply ring is 1 MiB");
+    ir_disconnect(roomy);
+  }
+
+  uint64_t fn_cap = 0;
+  CHECK(ir_function_arena_capacity(cli, "c-add", "fn-key", &fn_cap) == IR_OK, "function arena capacity read");
+  CHECK(fn_cap == (512u << 10), "default function arena is 512 KiB");
+  CHECK(ir_function_arena_capacity(cli, "c-add", "nope", &fn_cap) == IR_ERR_DENIED, "wrong key denied here too");
+
   ir_publisher_free(pub);
   ir_disconnect(cli);
   ir_disconnect(svc);

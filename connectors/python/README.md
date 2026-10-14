@@ -50,6 +50,34 @@ fut = conn.call_async("add", e.getvalue())   # fut.result() -> bytes
 conn.close()
 ```
 
+### Ring sizes
+
+Every ring on the bus has a fixed size, and each is sized by the side that knows
+what has to fit through it. The sizes are readable from both ends, so a limit
+derived from one is a limit on the ring the two sides actually share — not a
+constant each hopes the other kept to.
+
+```python
+# A channel's arena is sized by its publisher: it knows how big its messages are.
+# The broker clamps to [256 KiB, 128 MiB] and rounds up to a power of two, and
+# `capacity` reports what it actually allocated — a message bigger than that can
+# never be published, so cut a stream into messages by this.
+pub = conn.publish_channel("files", SCHEMA, arena_cap=8 * 1024 * 1024)
+chunk = pub.capacity // 3          # three messages in flight keeps it moving
+sub = conn.subscribe(channel_id)   # the subscriber reads the same header
+sub.capacity
+
+# A connection's reply ring is sized by the caller: every reply arrives through
+# that one ring (control replies and RPC responses alike), so it is the ceiling
+# on an answer. Raised to the default if smaller, capped at 128 MiB, rounded up.
+cli = Connection("my-py-client", reply_cap=4 * 1024 * 1024)
+cli.reply_capacity
+
+# A function's request arena is sized by the service exposing it, and read by the
+# caller that writes into it (one control round-trip, so remember the answer).
+cli.function_arena_capacity("upload")
+```
+
 ## CI & tests
 
 CI (see `.depl/config.yaml`) lints with `ruff` (`uvx ruff check` + `ruff format

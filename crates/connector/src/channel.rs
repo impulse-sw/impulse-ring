@@ -49,6 +49,15 @@ impl Publisher {
     self.schema_fp
   }
 
+  /// Bytes of data region this channel's arena holds.
+  ///
+  /// What the broker actually allocated, not what was asked for: it clamps the
+  /// request and rounds it up to a power of two. A publisher that sizes its
+  /// frames by the arena must size them by *this*.
+  pub fn capacity(&self) -> usize {
+    self.ring.read().unwrap().capacity()
+  }
+
   /// Publish a message (Avro-encoded), blocking briefly if the ring is full.
   pub fn publish<T: Serialize>(&self, msg: &T) -> io::Result<()> {
     let body = avro::encode(&self.schema, msg)?;
@@ -83,6 +92,11 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
+  /// Bytes of data region this channel's arena holds.
+  pub fn capacity(&self) -> usize {
+    self.ring.read().unwrap().capacity()
+  }
+
   pub(crate) fn new(ring: RingCell, schema: Arc<Schema>, schema_fp: Fingerprint) -> Self {
     Subscriber {
       ring,

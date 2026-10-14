@@ -41,13 +41,19 @@ The broker is never on the data hot path. After the control handshake:
 
 * **Publish/subscribe:** the broker creates and formats the channel arena and
   returns its name. The publisher attaches as the ring's producer; the
-  subscriber attaches as its consumer. Messages flow directly between them.
+  subscriber attaches as its consumer. Messages flow directly between them. The
+  publisher sizes the arena (`PublishChannel.arena_cap`, `0` = default), because
+  it is the side that knows how big its frames are; the broker clamps the request
+  to `[MIN_ARENA_CAP, MAX_ARENA_CAP]` and rounds it up to a power of two, and both
+  ends read what it actually allocated out of the ring header.
 * **RPC:** `ExposeFunction` creates the function's request arena (service is the
   consumer). A caller `LookupFunction` to learn the arena name and the request/
   response fingerprints, validates compatibility, then writes an `RpcRequest`
   (with its own `reply_segment` and a fresh `correlation_id`) into the request
   arena. The service runs the handler and writes an `RpcResponse` into the
-  caller's reply segment; the caller's dispatcher resolves the pending call.
+  caller's reply segment; the caller's dispatcher resolves the pending call. The
+  caller sizes its own reply segment, so the ceiling on an inline response is a
+  property of the ring the two sides share rather than a constant each assumes.
 
 ## Liveness & cleanup
 

@@ -106,6 +106,32 @@ def python_self_test():
     except RingError:
         check(True, "rpc wrong key denied")
 
+    # Ring sizes: the publisher sizes its channel's arena (it is the side that
+    # knows how big its messages are), the caller sizes its own reply ring (only
+    # the caller knows how big an answer it is willing to receive), and both ends
+    # read the capacity out of the same ring header.
+    plain = svc.publish_channel("py-plain", METRIC)
+    check(plain.capacity == 512 * 1024, "default channel arena is 512 KiB")
+    big = svc.publish_channel("py-big", METRIC, arena_cap=3 * 1024 * 1024)
+    check(big.capacity == 4 * 1024 * 1024, "3 MiB arena rounds up to 4 MiB")
+
+    big_id = next((c.channel_id for c in cli.list_channels() if c.name == "py-big"), None)
+    check(big_id is not None, "sized channel listed")
+    big_sub = cli.subscribe(big_id)
+    check(big_sub.capacity == big.capacity, "subscriber sees the same arena")
+
+    check(cli.reply_capacity == 64 * 1024, "default reply ring is 64 KiB")
+    roomy = Connection("py-roomy", reply_cap=1024 * 1024)
+    check(roomy.reply_capacity == 1024 * 1024, "reply ring is 1 MiB")
+    roomy.close()
+
+    check(cli.function_arena_capacity("py-add", key="fn-key") == 512 * 1024, "default function arena is 512 KiB")
+    try:
+        cli.function_arena_capacity("py-add", key="nope")
+        check(False, "wrong key denied here too")
+    except RingError:
+        check(True, "wrong key denied here too")
+
     cli.close()
     svc.close()
 

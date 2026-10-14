@@ -56,6 +56,34 @@ ir::AvroWriter args; args.put_long(7).put_long(35);
 ir::Bytes resp = conn.call("add", args.bytes());
 ```
 
+### Ring sizes
+
+Every ring on the bus has a fixed size, and each is sized by the side that knows
+what has to fit through it. The sizes are readable from both ends, so a limit
+derived from one is a limit on the ring the two sides actually share — not a
+constant each hopes the other kept to.
+
+```cpp
+// A channel's arena is sized by its publisher: it knows how big its messages
+// are. The broker clamps to [256 KiB, 128 MiB] and rounds up to a power of two,
+// and capacity() reports what it actually allocated — a message bigger than that
+// can never be published, so cut a stream into messages by this.
+auto pub = conn.publish_channel("files", SCHEMA, "", 8 * 1024 * 1024);
+auto chunk = pub.capacity() / 3;        // three in flight keeps it moving
+auto sub = conn.subscribe(channel_id);  // the subscriber reads the same header
+sub.capacity();
+
+// A connection's reply ring is sized by the caller: every reply arrives through
+// that one ring (control replies and RPC responses alike), so it is the ceiling
+// on an answer. Raised to the default (64 KiB) if smaller, capped at 128 MiB.
+ir::Connection cli("my-cpp-client", 4 * 1024 * 1024);
+cli.reply_capacity();
+
+// A function's request arena is sized by the service exposing it, and read by
+// the caller that writes into it (one control round-trip, so remember it).
+cli.function_arena_capacity("upload");
+```
+
 Unlike the FFI-based TS connector, C++ **can** expose functions: the C service
 thread calls the C++ handler directly (it is all native code).
 

@@ -85,6 +85,15 @@ int main() {
       call_denied = true;
     }
     check(call_denied, "call wrong key denied");
+
+    // Ring sizes: the publisher sizes its channel, the caller sizes its own
+    // reply ring, and both ends read back what the broker actually allocated.
+    auto big = svc.publish_channel("cpp-metrics-big", METRIC, "", 3u << 20);
+    check(big.capacity() == (4u << 20), "3 MiB arena rounds up to 4 MiB");
+    check(cli.reply_capacity() == (1u << 16), "default reply ring is 64 KiB");
+    ir::Connection roomy("cpp-roomy", 1u << 20);
+    check(roomy.reply_capacity() == (1u << 20), "reply ring is 1 MiB");
+    check(cli.function_arena_capacity("cpp-add", "fn-key") == (512u << 10), "default function arena is 512 KiB");
   } catch (const ir::Error &e) {
     std::cerr << "FAIL: unexpected error: " << e.what() << "\n";
     failures++;
