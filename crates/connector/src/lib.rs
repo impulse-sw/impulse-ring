@@ -41,8 +41,6 @@ pub use rpc::{CallFuture, block_on};
 use client::{Inner, Reg, RingCell};
 use impulse_ring_core::avro::{self, Fingerprint};
 use impulse_ring_core::proto::{self, Kind};
-use impulse_ring_core::ring::Ring;
-use impulse_ring_core::shm::Segment;
 use impulse_ring_core::util;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -137,7 +135,14 @@ impl Connection {
       arena_cap,
       ring: cell.clone(),
     });
-    Ok(Publisher::new(cell, Arc::new(schema), fp, self.inner.clone(), id))
+    Ok(Publisher::new(
+      cell,
+      Arc::new(schema),
+      fp,
+      name.to_string(),
+      self.inner.clone(),
+      id,
+    ))
   }
 
   /// List all channels currently on the bus.
@@ -279,19 +284,12 @@ impl Connection {
     let (req_schema, arg_fp) = avro::parse(req_schema_json)?;
     let (resp_schema, expected_resp_fp) = avro::parse(resp_schema_json)?;
 
-    // Look the function up and check interface compatibility.
-    let lr = self.inner.do_lookup(fn_name, key)?;
-    if proto::i64_to_fp(lr.req_fp) != arg_fp {
-      return Err(io::Error::other("call rejected: request schema mismatch"));
-    }
-    if proto::i64_to_fp(lr.resp_fp) != expected_resp_fp {
-      return Err(io::Error::other("call rejected: response schema mismatch"));
-    }
+    // Resolve the callee — from this connection's cache when it has been called
+    // before — and check interface compatibility.
+    let callee = self.inner.matching_callee(fn_name, key, arg_fp, expected_resp_fp)?;
 
     // Encode args and place the request on the function's arena.
     let args = avro::encode(&req_schema, req)?;
-    let fn_seg = Arc::new(Segment::open(&lr.req_arena)?);
-    let fn_ring = Ring::attach(fn_seg, 0)?;
 
     let rpc_corr = Self::next_corr();
     let slot = self.inner.register(rpc_corr);
@@ -303,11 +301,24 @@ impl Connection {
       args,
     };
     let req_frame = proto::to_frame(Kind::RpcRequest, &rpc_req)?;
-    if !fn_ring.push_blocking(&req_frame.encode(), Some(Duration::from_secs(2))) {
+    if !callee.ring.push_blocking(&req_frame.encode(), Some(Duration::from_secs(2))) {
       self.inner.drop_pending(rpc_corr);
+      // A full arena can also be a *dead* arena. If the callee restarted onto a
+      // fresh one, the ring we are holding is an orphan nobody drains: it fills
+      // with a couple of abandoned requests and then stays full for good. So
+      // forget the resolution and let the next call ask the broker again — a
+      // callee that is merely busy pays one lookup for that, on an error path
+      // it was already on.
+      self.inner.forget_callee(fn_name, key);
       return Err(io::Error::other("function request ring full"));
     }
-    Ok(CallFuture::new(slot, Arc::new(resp_schema), expected_resp_fp))
+    Ok(CallFuture::new(
+      slot,
+      Arc::new(resp_schema),
+      expected_resp_fp,
+      self.inner.clone(),
+      rpc_corr,
+    ))
   }
 
   /// Blocking convenience wrapper around [`Connection::call`].
@@ -328,10 +339,23 @@ impl Connection {
     Resp: DeserializeOwned,
   {
     self.inner.with_reconnect(|| {
-      let fut = self.call::<Req, Resp>(fn_name, key, req, req_schema_json, resp_schema_json)?;
-      match rpc::block_on(fut, timeout) {
-        Some(res) => res,
-        None => Err(io::Error::new(io::ErrorKind::TimedOut, "rpc call timed out")),
+      let attempt = || -> io::Result<Resp> {
+        let fut = self.call::<Req, Resp>(fn_name, key, req, req_schema_json, resp_schema_json)?;
+        match rpc::block_on(fut, timeout) {
+          Some(res) => res,
+          None => Err(io::Error::new(io::ErrorKind::TimedOut, "rpc call timed out")),
+        }
+      };
+      match attempt() {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+          // Silence can also mean the callee restarted and re-exposed itself on
+          // a fresh arena while we were holding its old one, in which case the
+          // request went into a segment nobody reads. Resolve again — through
+          // the broker this time — and give it one more go.
+          self.inner.forget_callee(fn_name, key);
+          attempt()
+        }
+        other => other,
       }
     })
   }

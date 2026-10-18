@@ -3,7 +3,7 @@
 //! (channel messages and RPC payloads) flows peer-to-peer through arenas the
 //! broker hands out — the broker is never on the hot copy path.
 
-use crate::registry::{ChannelMeta, FunctionMeta, Registry};
+use crate::registry::{ChannelMeta, FunctionMeta, Registry, Release};
 use impulse_ring_core::control;
 use impulse_ring_core::frame::Frame;
 use impulse_ring_core::proto::{self, Kind, status};
@@ -13,7 +13,27 @@ use impulse_ring_core::util;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long a released channel that never had a subscriber stays resolvable.
+///
+/// A publisher names its channel in a response and then streams onto it, so the
+/// subscriber learns the name only once it has read that response. Releasing the
+/// channel the instant the publisher drops would lose that race for a body small
+/// enough to be pushed in full before anyone subscribed.
+const RELEASE_GRACE: Duration = Duration::from_secs(30);
+
+/// How often the control loop looks for releases that have outlived the grace.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the broker waits to place a reply on a client's reply ring.
+///
+/// Deliberately short: replies are pushed from the single control-plane loop, so
+/// every millisecond spent waiting on one stuck client is a millisecond no other
+/// client on the bus is served. A client that is draining its reply ring at all
+/// takes its reply immediately; one that is not gets its reply dropped (and
+/// times out on its own side) instead of holding the bus still.
+const REPLY_PUSH_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub struct Broker {
   _control_seg: Arc<Segment>,
@@ -158,11 +178,21 @@ impl Broker {
 
   /// Process control submissions until `should_run` returns false.
   pub fn run(&mut self, should_run: impl Fn() -> bool) {
+    let mut last_sweep = Instant::now();
     while should_run() {
       if let Some(bytes) = self.submission.pop_blocking(Some(Duration::from_millis(200)))
         && let Err(e) = self.handle(&bytes)
       {
         log::warn!("control message error: {e}");
+      }
+      // Deferred releases are the only work this loop owes nobody in
+      // particular, so it does them between messages rather than on a timer
+      // thread of their own.
+      if last_sweep.elapsed() >= SWEEP_INTERVAL {
+        last_sweep = Instant::now();
+        for arena in self.reg.reap_released(RELEASE_GRACE) {
+          self.reclaim_arena(&arena);
+        }
       }
     }
   }
@@ -176,6 +206,7 @@ impl Broker {
       Kind::Register => self.on_register(&frame),
       Kind::Unregister => self.on_unregister(&frame),
       Kind::PublishChannel => self.on_publish(&frame),
+      Kind::Unpublish => self.on_unpublish(&frame),
       Kind::ListChannels => self.on_list(&frame),
       Kind::Subscribe => self.on_subscribe(&frame),
       Kind::ExposeFunction => self.on_expose(&frame),
@@ -192,7 +223,7 @@ impl Broker {
       .get(&client_id)
       .ok_or_else(|| io::Error::other("reply ring for client not found"))?;
     let frame = proto::to_frame(kind, msg)?;
-    if !ring.push_blocking(&frame.encode(), Some(Duration::from_secs(2))) {
+    if !ring.push_blocking(&frame.encode(), Some(REPLY_PUSH_TIMEOUT)) {
       return Err(io::Error::other("reply ring full (client stuck?)"));
     }
     Ok(())
@@ -271,29 +302,35 @@ impl Broker {
   fn on_publish(&mut self, frame: &Frame) -> io::Result<()> {
     let m: proto::PublishChannel = proto::from_frame(Kind::PublishChannel, frame)?;
     if self.reg.channel_name_taken(&m.channel) {
-      // As with functions: reclaim the channel name if its owner has died.
-      match self.reg.dead_channel_owner(&m.channel, Self::owner_alive) {
-        Some(dead) => {
-          log::warn!(
-            "reclaiming channel '{}' from dead owner client={dead}; re-publishing for client {}",
-            m.channel,
-            m.client_id
-          );
-          self.release_client(dead);
-        }
-        None => {
-          return self.reply(
-            m.client_id,
-            Kind::PublishReply,
-            &proto::PublishReply {
-              correlation_id: m.correlation_id,
-              channel_id: 0,
-              schema_fp: 0,
-              arena: String::new(),
-              status: status::ERR_EXISTS,
-              message: "channel already exists".into(),
-            },
-          );
+      if let Some(arena) = self.reg.reap_if_released(&m.channel) {
+        // The name was sitting out its release grace. Its publisher is gone, so
+        // this publish takes the name over instead of being refused.
+        self.reclaim_arena(&arena);
+      } else {
+        // As with functions: reclaim the channel name if its owner has died.
+        match self.reg.dead_channel_owner(&m.channel, Self::owner_alive) {
+          Some(dead) => {
+            log::warn!(
+              "reclaiming channel '{}' from dead owner client={dead}; re-publishing for client {}",
+              m.channel,
+              m.client_id
+            );
+            self.release_client(dead);
+          }
+          None => {
+            return self.reply(
+              m.client_id,
+              Kind::PublishReply,
+              &proto::PublishReply {
+                correlation_id: m.correlation_id,
+                channel_id: 0,
+                schema_fp: 0,
+                arena: String::new(),
+                status: status::ERR_EXISTS,
+                message: "channel already exists".into(),
+              },
+            );
+          }
         }
       }
     }
@@ -320,7 +357,27 @@ impl Broker {
     // message have nothing in common but the channel they travel on. `0` (and an
     // older connector, which omits the field) means the default.
     let arena_cap = control::clamp_arena_cap(m.arena_cap.max(0) as usize);
-    let arena = self.make_arena(util::channel_arena(channel_id as u64), arena_cap)?;
+    let arena = match self.make_arena(util::channel_arena(channel_id as u64), arena_cap) {
+      Ok(a) => a,
+      Err(e) => {
+        // Say so instead of dropping out of `handle`. A client that hears
+        // nothing waits out its control timeout and cannot tell a broker that
+        // is out of shared memory from one that has died.
+        log::warn!("cannot allocate an arena for channel '{}': {e}", m.channel);
+        return self.reply(
+          m.client_id,
+          Kind::PublishReply,
+          &proto::PublishReply {
+            correlation_id: m.correlation_id,
+            channel_id: 0,
+            schema_fp: 0,
+            arena: String::new(),
+            status: status::ERR_INTERNAL,
+            message: format!("cannot allocate a channel arena: {e}"),
+          },
+        );
+      }
+    };
     if arena_cap != control::ARENA_CAP {
       // Debug, not info: a server that sizes its stream channels publishes one per
       // large response, and an operator watching a busy proxy does not need a line
@@ -351,6 +408,40 @@ impl Broker {
     )
   }
 
+  /// Take a channel back from a publisher that is done with it: the name
+  /// becomes free again and the arena is unlinked.
+  ///
+  /// Without this message a channel outlived its publisher until the whole
+  /// client departed, so a service that published one channel per streamed body
+  /// — which is what the HTTP layer does for anything too large to travel
+  /// inline — leaked an arena per body for as long as it ran.
+  ///
+  /// Nothing is answered: see [`proto::Unpublish`].
+  fn on_unpublish(&mut self, frame: &Frame) -> io::Result<()> {
+    let m: proto::Unpublish = proto::from_frame(Kind::Unpublish, frame)?;
+    match self.reg.release_channel(&m.channel, m.client_id) {
+      Release::Now(arena) => {
+        self.reclaim_arena(&arena);
+        log::debug!("channel '{}' released by client {}", m.channel, m.client_id);
+      }
+      Release::Deferred => {
+        log::debug!(
+          "channel '{}' released by client {} with no subscriber yet; holding it for the grace period",
+          m.channel,
+          m.client_id
+        );
+      }
+      Release::Refused => {
+        log::warn!(
+          "client {} cannot release channel '{}': unknown name, or not its own",
+          m.client_id,
+          m.channel
+        );
+      }
+    }
+    Ok(())
+  }
+
   fn on_list(&mut self, frame: &Frame) -> io::Result<()> {
     let m: proto::ListChannels = proto::from_frame(Kind::ListChannels, frame)?;
     let channels = self.reg.list_channels();
@@ -370,13 +461,18 @@ impl Broker {
       .reg
       .resolve_subscribe(m.channel_id, &m.access_key, proto::i64_to_fp(m.expected_fp))
     {
-      Ok((arena, fp)) => proto::SubscribeReply {
-        correlation_id: m.correlation_id,
-        arena,
-        schema_fp: proto::fp_to_i64(fp),
-        status: status::OK,
-        message: String::new(),
-      },
+      Ok((arena, fp)) => {
+        // Now that this channel has a subscriber, its publisher's release needs
+        // no grace period — nobody is still trying to find it by name.
+        self.reg.mark_subscribed(m.channel_id);
+        proto::SubscribeReply {
+          correlation_id: m.correlation_id,
+          arena,
+          schema_fp: proto::fp_to_i64(fp),
+          status: status::OK,
+          message: String::new(),
+        }
+      }
       Err((code, msg)) => proto::SubscribeReply {
         correlation_id: m.correlation_id,
         arena: String::new(),
@@ -429,7 +525,24 @@ impl Broker {
     };
     let fn_id = self.reg.alloc_fn_id();
     let arena_cap = control::clamp_arena_cap(m.req_arena_cap.max(0) as usize);
-    let req_arena = self.make_arena(util::function_arena(fn_id as u64), arena_cap)?;
+    let req_arena = match self.make_arena(util::function_arena(fn_id as u64), arena_cap) {
+      Ok(a) => a,
+      Err(e) => {
+        // As in `on_publish`: answered, not swallowed. This one matters even
+        // more — a service that cannot expose its function is a service nobody
+        // on the bus can reach, and it deserves to be told why.
+        log::warn!("cannot allocate a request arena for function '{}': {e}", m.fn_name);
+        return self.reply(
+          m.client_id,
+          Kind::ExposeReply,
+          &err_expose(
+            m.correlation_id,
+            status::ERR_INTERNAL,
+            &format!("cannot allocate a request arena: {e}"),
+          ),
+        );
+      }
+    };
     if arena_cap != control::ARENA_CAP {
       log::info!("function '{}' uses a {arena_cap}-byte request arena", m.fn_name);
     }

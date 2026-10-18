@@ -136,10 +136,27 @@ pub enum Reg {
   },
 }
 
+/// A resolved callee: what the broker answered for a `LookupFunction`, with the
+/// function's request arena already attached.
+///
+/// Kept per `(function, access key)` because resolving one costs a control
+/// round-trip *and* an `shm_open`/`mmap` of the arena, while the answer does not
+/// change for as long as the callee keeps that function exposed. Until this was
+/// cached, every RPC any application made paid both — which put the broker's
+/// single control-plane thread on the hot path of every call on the bus, so one
+/// busy caller could starve every other application's lookups.
+pub struct Callee {
+  pub req_fp: Fingerprint,
+  pub resp_fp: Fingerprint,
+  pub ring: Ring,
+}
+
 /// Shared per-connection state.
 pub struct Inner {
   transport: RwLock<Transport>,
   pub pending: Mutex<HashMap<i64, Arc<Slot>>>,
+  /// Resolved callees, keyed by `(function name, access key)`.
+  callees: Mutex<HashMap<(String, String), Arc<Callee>>>,
   /// The local name we registered under (replayed verbatim on reconnect).
   app_name: String,
   /// Requested reply-ring capacity, kept so a reconnect rebuilds the same ring:
@@ -236,6 +253,7 @@ impl Inner {
     let inner = Arc::new(Inner {
       transport: RwLock::new(transport),
       pending: Mutex::new(HashMap::new()),
+      callees: Mutex::new(HashMap::new()),
       app_name: app_name.to_string(),
       reply_cap,
       running: Arc::new(AtomicBool::new(true)),
@@ -264,13 +282,73 @@ impl Inner {
     self.transport.read().unwrap().reply_ring.capacity()
   }
 
-  /// Capacity of a function's request arena: one lookup, then the arena's own
-  /// header. Both ends read it from the same place, so neither has to assume
-  /// what the other kept to.
+  /// Capacity of a function's request arena, read from the arena's own header.
+  /// Both ends read it from the same place, so neither has to assume what the
+  /// other kept to.
   pub fn function_arena_capacity(&self, fn_name: &str, key: Option<&str>) -> io::Result<usize> {
+    Ok(self.callee(fn_name, key)?.ring.capacity())
+  }
+
+  /// Resolve `fn_name` to its interface and request arena, from the cache when
+  /// it is there and through the broker when it is not.
+  pub fn callee(&self, fn_name: &str, key: Option<&str>) -> io::Result<Arc<Callee>> {
+    let id = (fn_name.to_string(), key.unwrap_or("").to_string());
+    if let Some(c) = self.callees.lock().unwrap().get(&id) {
+      return Ok(c.clone());
+    }
+    // The lock is deliberately not held across the round-trip: two callers
+    // racing on the same cold entry cost one extra lookup between them, while a
+    // lock held that long would stall every other call this connection makes.
     let lr = self.do_lookup(fn_name, key)?;
     let seg = Arc::new(Segment::open(&lr.req_arena)?);
-    Ok(Ring::attach(seg, 0)?.capacity())
+    let callee = Arc::new(Callee {
+      req_fp: proto::i64_to_fp(lr.req_fp),
+      resp_fp: proto::i64_to_fp(lr.resp_fp),
+      ring: Ring::attach(seg, 0)?,
+    });
+    self.callees.lock().unwrap().insert(id, callee.clone());
+    Ok(callee)
+  }
+
+  /// Resolve a callee and check that its interface is the one the caller
+  /// compiled against.
+  ///
+  /// A cached resolution that no longer matches is fetched again before the call
+  /// is refused: a callee that restarted with a changed interface would
+  /// otherwise keep being judged against a stale answer.
+  pub fn matching_callee(
+    &self,
+    fn_name: &str,
+    key: Option<&str>,
+    req_fp: Fingerprint,
+    resp_fp: Fingerprint,
+  ) -> io::Result<Arc<Callee>> {
+    let c = self.callee(fn_name, key)?;
+    if c.req_fp == req_fp && c.resp_fp == resp_fp {
+      return Ok(c);
+    }
+    self.forget_callee(fn_name, key);
+    let c = self.callee(fn_name, key)?;
+    if c.req_fp != req_fp {
+      return Err(io::Error::other("call rejected: request schema mismatch"));
+    }
+    if c.resp_fp != resp_fp {
+      return Err(io::Error::other("call rejected: response schema mismatch"));
+    }
+    Ok(c)
+  }
+
+  /// Forget a cached resolution so the next call resolves it again.
+  ///
+  /// Used when a call timed out: the callee may have restarted and re-exposed
+  /// itself on a fresh arena, which leaves us pushing requests into a segment
+  /// nobody reads any more — and no amount of waiting fixes that.
+  pub fn forget_callee(&self, fn_name: &str, key: Option<&str>) {
+    self
+      .callees
+      .lock()
+      .unwrap()
+      .remove(&(fn_name.to_string(), key.unwrap_or("").to_string()));
   }
 
   pub fn epoch(&self) -> u64 {
@@ -544,6 +622,9 @@ impl Inner {
     let new_epoch = transport.epoch;
     // In-flight calls bound to the dead broker will never be answered.
     self.pending.lock().unwrap().clear();
+    // Every arena the old broker handed out is gone with it, so no resolution
+    // we are holding is worth anything now.
+    self.callees.lock().unwrap().clear();
     *self.transport.write().unwrap() = transport;
     let client_id = self.do_register()?;
     self.replay()?;
@@ -610,6 +691,26 @@ impl Inner {
       }
     }
     Ok(())
+  }
+
+  /// Best-effort release of a channel this connection published.
+  ///
+  /// Fire-and-forget on a short deadline, because it is sent from
+  /// `Publisher::drop`: a publisher going away must not block on the control
+  /// plane. Losing it costs only what it cost before this message existed — the
+  /// broker still reclaims the arena when this connection departs.
+  pub fn send_unpublish(&self, channel: &str) {
+    let corr = Self::next_corr();
+    if let Ok(frame) = proto::to_frame(
+      Kind::Unpublish,
+      &proto::Unpublish {
+        correlation_id: corr,
+        client_id: self.client_id(),
+        channel: channel.to_string(),
+      },
+    ) {
+      let _ = self.submit(&frame, Duration::from_millis(200));
+    }
   }
 
   /// Best-effort `Unregister` on shutdown (the connection is going away).

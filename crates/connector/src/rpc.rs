@@ -2,7 +2,7 @@
 //! service loop that executes an exposed function and ships the Avro result back
 //! to the caller's reply segment.
 
-use crate::client::{RingCell, Slot};
+use crate::client::{Inner, RingCell, Slot};
 use apache_avro::Schema;
 use impulse_ring_core::avro;
 use impulse_ring_core::frame::Frame;
@@ -25,15 +25,26 @@ pub struct CallFuture<Resp> {
   slot: Arc<Slot>,
   resp_schema: Arc<Schema>,
   expected_resp_fp: u64,
+  /// Kept so that abandoning this call also abandons its pending slot.
+  inner: Arc<Inner>,
+  corr: i64,
   _pd: std::marker::PhantomData<Resp>,
 }
 
 impl<Resp: DeserializeOwned> CallFuture<Resp> {
-  pub(crate) fn new(slot: Arc<Slot>, resp_schema: Arc<Schema>, expected_resp_fp: u64) -> Self {
+  pub(crate) fn new(
+    slot: Arc<Slot>,
+    resp_schema: Arc<Schema>,
+    expected_resp_fp: u64,
+    inner: Arc<Inner>,
+    corr: i64,
+  ) -> Self {
     CallFuture {
       slot,
       resp_schema,
       expected_resp_fp,
+      inner,
+      corr,
       _pd: std::marker::PhantomData,
     }
   }
@@ -54,6 +65,16 @@ impl<Resp: DeserializeOwned> CallFuture<Resp> {
       )));
     }
     avro::decode(&self.resp_schema, &resp.result)
+  }
+}
+
+impl<Resp> Drop for CallFuture<Resp> {
+  fn drop(&mut self) {
+    // An abandoned call — one that timed out, or whose future was dropped —
+    // leaves its slot in the pending map. A late answer frees it, but a call
+    // that is never answered at all, which is what a callee that died looks
+    // like, would otherwise keep it for the connection's whole life.
+    self.inner.drop_pending(self.corr);
   }
 }
 

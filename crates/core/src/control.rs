@@ -29,7 +29,19 @@ const OFF_EPOCH: usize = 16;
 /// 64-aligned base of the submission ring within the control segment.
 pub const SUBMISSION_BASE: usize = 64;
 /// Submission ring data-region capacity (bytes).
-pub const SUBMISSION_CAP: usize = 1 << 16;
+///
+/// 256 KiB, and the reason it is not smaller is that this one ring carries the
+/// control traffic of *every* client on the bus, served by a single broker
+/// thread. A client whose request does not fit waits out `push_blocking` and
+/// then fails with `submission ring full (broker stuck?)` — and it is not its
+/// own traffic that filled the ring, so one busy application used to be able to
+/// take the control plane away from every other.
+///
+/// Safe to change in either direction without a `CTL_VERSION` bump: the broker
+/// creates and formats the control segment, and a client attaches by reading
+/// the capacity out of the ring header ([`attach_control`]) rather than from
+/// this constant.
+pub const SUBMISSION_CAP: usize = 1 << 18;
 
 /// Default reply-ring capacity for a per-client reply segment.
 ///

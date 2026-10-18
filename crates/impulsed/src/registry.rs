@@ -5,7 +5,8 @@
 use impulse_ring_core::avro::Fingerprint;
 use impulse_ring_core::proto::{self, ChannelInfo, status};
 use impulse_ring_core::util;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 pub struct ClientMeta {
   pub app_name: String,
@@ -37,6 +38,21 @@ pub struct FunctionMeta {
 /// Outcome of an access/compatibility check: an OK or an error status + message.
 pub type AccessResult = Result<(), (i32, String)>;
 
+/// What to do with a channel whose publisher has just released it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Release {
+  /// Reclaim the arena now; the name is already free. Somebody did subscribe,
+  /// so nobody is still looking this channel up by name.
+  Now(String),
+  /// Keep it resolvable for now. Nobody ever subscribed, and a subscriber on
+  /// its way (it learns the name from the response it is still reading) must
+  /// be able to find the channel. [`Registry::reap_released`] takes it once
+  /// the grace has passed.
+  Deferred,
+  /// Nothing released: the name is unknown, or it belongs to another client.
+  Refused,
+}
+
 #[derive(Default)]
 pub struct Registry {
   pub clients: HashMap<i64, ClientMeta>,
@@ -44,6 +60,12 @@ pub struct Registry {
   chan_by_name: HashMap<String, i64>,
   functions: HashMap<i64, FunctionMeta>,
   fn_by_name: HashMap<String, i64>,
+  /// Channels somebody has subscribed to at least once. The publisher's release
+  /// of such a channel needs no grace period (see [`Release`]).
+  subscribed: HashSet<i64>,
+  /// Channels released by their publisher but kept resolvable until the grace
+  /// passes, with the moment of release.
+  released: HashMap<i64, Instant>,
   next_client: i64,
   next_channel: i64,
   next_fn: i64,
@@ -104,12 +126,75 @@ impl Registry {
       .collect();
     let mut arenas = Vec::new();
     for id in ids {
-      if let Some(c) = self.channels.remove(&id) {
-        self.chan_by_name.remove(&c.name);
-        arenas.push(c.arena);
+      if let Some(arena) = self.drop_channel(id) {
+        arenas.push(arena);
       }
     }
     arenas
+  }
+
+  /// Forget channel `id` entirely — the entry, its name and its release
+  /// bookkeeping — and hand back its arena name.
+  fn drop_channel(&mut self, id: i64) -> Option<String> {
+    let c = self.channels.remove(&id)?;
+    self.chan_by_name.remove(&c.name);
+    self.subscribed.remove(&id);
+    self.released.remove(&id);
+    Some(c.arena)
+  }
+
+  /// Note that `channel_id` now has a subscriber, so its publisher's release
+  /// does not have to wait for one.
+  pub fn mark_subscribed(&mut self, channel_id: i64) {
+    self.subscribed.insert(channel_id);
+  }
+
+  /// A publisher is done with `name`: say whether the arena can go now — in
+  /// which case the name is free again — or has to wait for a late subscriber
+  /// (see [`Release`]).
+  ///
+  /// Only the channel's own owner may release it; anyone else is [`Release::Refused`].
+  pub fn release_channel(&mut self, name: &str, owner: i64) -> Release {
+    let Some(&id) = self.chan_by_name.get(name) else {
+      return Release::Refused;
+    };
+    if self.channels.get(&id).map(|c| c.owner) != Some(owner) {
+      return Release::Refused;
+    }
+    if self.subscribed.contains(&id) {
+      return match self.drop_channel(id) {
+        Some(arena) => Release::Now(arena),
+        None => Release::Refused,
+      };
+    }
+    self.released.insert(id, Instant::now());
+    Release::Deferred
+  }
+
+  /// Reclaim every deferred release older than `grace`, returning their arena
+  /// names. Called on the broker's idle tick.
+  pub fn reap_released(&mut self, grace: Duration) -> Vec<String> {
+    let due: Vec<i64> = self
+      .released
+      .iter()
+      .filter(|(_, at)| at.elapsed() >= grace)
+      .map(|(id, _)| *id)
+      .collect();
+    due.into_iter().filter_map(|id| self.drop_channel(id)).collect()
+  }
+
+  /// If `name` is held by a channel its publisher already released, take it
+  /// back now and return its arena.
+  ///
+  /// A name inside its release grace must not refuse a fresh publish: the grace
+  /// exists to let a late subscriber *find* the old channel, not to keep the
+  /// name hostage after its publisher has gone.
+  pub fn reap_if_released(&mut self, name: &str) -> Option<String> {
+    let id = *self.chan_by_name.get(name)?;
+    if !self.released.contains_key(&id) {
+      return None;
+    }
+    self.drop_channel(id)
   }
 
   /// Remove every function owned by `owner`, returning their request-arena names.
@@ -304,6 +389,136 @@ mod tests {
     });
     let broker_alive = |pid: i32| pid == 0 || pid == 12345 /* stand-in for pid_alive */;
     assert_eq!(r.dead_channel_owner("legacy.events", broker_alive), None);
+  }
+
+  /// A channel with a subscriber is reclaimed the moment its publisher lets go:
+  /// nobody is left looking it up by name.
+  #[test]
+  fn a_subscribed_channel_is_released_at_once() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 1);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+    r.mark_subscribed(cid);
+
+    assert_eq!(
+      r.release_channel("body", owner),
+      Release::Now("/impulse-ring.arena.1.v1".into())
+    );
+    // Gone for good: the name is free and there is nothing left to reap.
+    assert!(!r.channel_name_taken("body"));
+    assert!(r.reap_released(Duration::ZERO).is_empty());
+  }
+
+  /// A channel nobody ever subscribed to keeps its arena for the grace period.
+  /// The subscriber learns the channel's name from a response it may still be
+  /// reading, so releasing it at once would lose that race.
+  #[test]
+  fn a_released_channel_waits_for_a_late_subscriber() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 1);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+
+    assert_eq!(r.release_channel("body", owner), Release::Deferred);
+    // Still resolvable, so a subscriber that arrives now still finds it.
+    assert!(r.channel_name_taken("body"));
+    assert!(r.resolve_subscribe(cid, "", 0).is_ok());
+    // Nothing is due while the grace holds.
+    assert!(r.reap_released(Duration::from_secs(3600)).is_empty());
+    // Once it passes, the arena comes back.
+    assert_eq!(r.reap_released(Duration::ZERO), vec!["/impulse-ring.arena.1.v1"]);
+    assert!(!r.channel_name_taken("body"));
+  }
+
+  /// Releasing is not a way to take somebody else's channel away.
+  #[test]
+  fn only_the_owner_releases_a_channel() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 1);
+    let other = r.add_client("intruder".into(), 2);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+
+    assert_eq!(r.release_channel("body", other), Release::Refused);
+    assert_eq!(r.release_channel("absent", owner), Release::Refused);
+    assert!(r.channel_name_taken("body"));
+  }
+
+  /// The grace is there to let a late subscriber find the old channel, not to
+  /// hold the name after its publisher has gone.
+  #[test]
+  fn a_name_in_its_grace_does_not_refuse_a_fresh_publish() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 1);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+    assert_eq!(r.release_channel("body", owner), Release::Deferred);
+
+    // The name is taken, but only by a release waiting out its grace.
+    assert!(r.channel_name_taken("body"));
+    assert_eq!(r.reap_if_released("body"), Some("/impulse-ring.arena.1.v1".into()));
+    assert!(!r.channel_name_taken("body"));
+    // And a live channel is never taken this way.
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.2.v1".into(),
+    });
+    assert_eq!(r.reap_if_released("body"), None);
+  }
+
+  /// A departing client takes its channels with it, release bookkeeping and all.
+  #[test]
+  fn a_departing_client_leaves_no_release_behind() {
+    let mut r = Registry::new();
+    let owner = r.add_client("svc".into(), 1);
+    let cid = r.alloc_channel_id();
+    r.insert_channel(ChannelMeta {
+      id: cid,
+      name: "body".into(),
+      owner,
+      schema_fp: 1,
+      key: None,
+      arena: "/impulse-ring.arena.1.v1".into(),
+    });
+    assert_eq!(r.release_channel("body", owner), Release::Deferred);
+
+    assert_eq!(r.remove_client_channels(owner), vec!["/impulse-ring.arena.1.v1"]);
+    // The arena must not be handed out a second time by the sweep.
+    assert!(r.reap_released(Duration::ZERO).is_empty());
   }
 
   #[test]

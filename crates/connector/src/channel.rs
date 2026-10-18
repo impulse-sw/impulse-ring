@@ -21,6 +21,10 @@ pub struct Publisher {
   ring: RingCell,
   schema: Arc<Schema>,
   schema_fp: Fingerprint,
+  /// The channel's name, kept so dropping this publisher can hand the channel
+  /// back to the broker. By name and not by id, because a replay onto a
+  /// restarted broker gives the channel a new id but the same name.
+  channel: String,
   // Held so the channel can be replayed onto a fresh broker after a restart, and
   // deregistered when the publisher is dropped.
   inner: Arc<Inner>,
@@ -32,6 +36,7 @@ impl Publisher {
     ring: RingCell,
     schema: Arc<Schema>,
     schema_fp: Fingerprint,
+    channel: String,
     inner: Arc<Inner>,
     reg_id: u64,
   ) -> Self {
@@ -39,6 +44,7 @@ impl Publisher {
       ring,
       schema,
       schema_fp,
+      channel,
       inner,
       reg_id,
     }
@@ -80,7 +86,15 @@ impl Publisher {
 
 impl Drop for Publisher {
   fn drop(&mut self) {
+    // Deregister before releasing, so a reconnect racing with this drop cannot
+    // replay a channel we have just handed back.
     self.inner.deregister(self.reg_id);
+    // Hand the channel back: its name becomes free and its arena is unlinked.
+    // Without this the channel outlived its publisher until the whole
+    // connection departed, so an application that publishes a channel per
+    // streamed body — which is what the HTTP layer does for every body too
+    // large to travel inline — left an arena behind for each one.
+    self.inner.send_unpublish(&self.channel);
   }
 }
 

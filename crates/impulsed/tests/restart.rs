@@ -144,7 +144,18 @@ fn connections_recover_after_broker_restart() {
   };
   assert_eq!(resp.sum, 42, "RPC must work again after the broker restart");
 
-  // The connection now tracks the *new* broker generation.
+  // The connection ends up tracking the *new* broker generation.
+  //
+  // Polled, not asserted outright, because a successful call no longer proves a
+  // reconnect happened: a caller resolves a callee once and then talks to it
+  // peer-to-peer, so two peers still mapped to the previous generation's arena
+  // keep answering each other across the restart (the segment is unlinked, but
+  // their mappings live on). What moves them onto the new broker is the
+  // watcher, within a tick or two.
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while client.broker_epoch() == epoch_before && Instant::now() < deadline {
+    std::thread::sleep(Duration::from_millis(50));
+  }
   assert_ne!(client.broker_epoch(), epoch_before, "epoch must advance after restart");
 
   // The service's published channel was replayed: the same publisher handle still

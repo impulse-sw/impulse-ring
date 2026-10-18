@@ -388,6 +388,65 @@ fn full_flow_pubsub_and_rpc() {
     assert_eq!(roomy.reply_capacity(), 8 * 1024 * 1024);
   }
 
+  // Releasing a channel: a publisher that drops hands its channel back, so the
+  // name is free again and the arena is unlinked.
+  //
+  // Until that message existed a channel outlived its publisher until the whole
+  // connection departed, so an application publishing one channel per streamed
+  // body — which is what the HTTP layer does for every body too large to travel
+  // inline — left an arena in `/dev/shm` for each one, and could never reuse a
+  // name. The second round of this loop is what used to fail.
+  {
+    let svc = Connection::connect("release-svc").expect("connect");
+    let client = Connection::connect("release-client").expect("connect");
+    let before = scan_ring_segments().len();
+
+    for round in 0..8 {
+      let publisher = svc
+        .publish_channel("stream.body", METRIC_SCHEMA, None)
+        .expect("publish the same channel name every round");
+      publisher
+        .publish(&Metric {
+          name: "cpu".into(),
+          value: round as f64,
+        })
+        .expect("publish a frame");
+
+      // A subscriber finds it by name and drains it, the way the HTTP layer's
+      // body channels are used.
+      let id = client
+        .list_channels()
+        .expect("list channels")
+        .into_iter()
+        .find(|c| c.name == "stream.body")
+        .expect("the channel is listed")
+        .channel_id;
+      let sub = client.subscribe(id, None, METRIC_SCHEMA).expect("subscribe");
+      let got: Metric = sub.recv(Duration::from_secs(2)).expect("recv ok").expect("a message");
+      assert_eq!(got.value, round as f64);
+
+      drop(sub);
+      drop(publisher);
+      // The release is fire-and-forget, so give the broker a beat to apply it.
+      std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Eight channels published and released: nothing of them is left.
+    let mut after = scan_ring_segments().len();
+    for _ in 0..20 {
+      if after <= before {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(50));
+      after = scan_ring_segments().len();
+    }
+    assert!(
+      after <= before,
+      "published-and-released channels left segments behind (before: {before}, after: {after})"
+    );
+  }
+  std::thread::sleep(Duration::from_millis(100));
+
   // Regression: once the owner of "metrics"/"add" has left (unregistered above),
   // a fresh app must be able to re-publish the same channel and re-expose the
   // same function instead of getting "already exists".

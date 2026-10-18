@@ -7,6 +7,7 @@
 | `Unregister` | `0x82cdc2b7ebd36a6a` |
 | `PublishChannel` | `0x9ba910d444c0784c` |
 | `PublishReply` | `0x055439d7c0240142` |
+| `Unpublish` | `0xca10dd5c1a896296` |
 | `ListChannels` | `0xa5035910e842f4e6` |
 | `ChannelList` | `0xa1048915e5931da2` |
 | `Subscribe` | `0x8ebc74e247531cff` |

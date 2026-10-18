@@ -139,6 +139,12 @@ cargo run -p impulse-ring-core --example dump_schemas fps  > spec/schemas/FINGER
 - Rings are **MPSC-safe** via a futex mutex on the producer side; a lock-free
   SPSC fast path is a planned, wire-compatible optimization.
 - One subscriber per channel; channel fan-out is a later milestone.
+- Releasing a channel (`Unpublish`) is implemented by the Rust connector. The
+  C/C++/Go/Python/TS connectors do not send it yet, so a publisher there holds
+  its channel — name and arena — until its connection closes.
+- A caller should resolve a function once and keep the answer (the Rust
+  connector does); the other connectors look up per call, which puts the
+  broker's single control thread on the hot path of every request.
 - Heartbeat reaping is lenient; access keys use salted SHA-256 (argon2 later).
 
 See [`spec/wire-format.md`](spec/wire-format.md) for the full contract.

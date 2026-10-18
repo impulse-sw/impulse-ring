@@ -48,6 +48,7 @@ pub enum Kind {
   Unregister,
   PublishChannel,
   PublishReply,
+  Unpublish,
   ListChannels,
   ChannelList,
   Subscribe,
@@ -122,6 +123,27 @@ pub struct PublishReply {
   pub arena: String,
   pub status: i32,
   pub message: String,
+}
+
+/// A publisher is done with a channel: the name may be reused and the arena
+/// reclaimed.
+///
+/// Addressed **by name**, not by channel id, because the id is the broker's and
+/// is reassigned on every restart — a publisher replayed onto a fresh broker
+/// holds a stale id but the same name. The broker only honours a release from
+/// the channel's own owner.
+///
+/// No reply: the publisher is usually dropping as it sends this, so there is
+/// nobody left to read one. A lost release costs exactly what it cost before
+/// this message existed — the arena is still reclaimed when the client departs.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Unpublish {
+  /// Unused (nothing is correlated against a message with no reply), but every
+  /// record carries one, and keeping it leaves room to answer later without a
+  /// schema change.
+  pub correlation_id: i64,
+  pub client_id: i64,
+  pub channel: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -284,6 +306,10 @@ fn schema_for(kind: Kind) -> &'static str {
       "PublishReply",
       r#"{"name":"correlation_id","type":"long"},{"name":"channel_id","type":"long"},{"name":"schema_fp","type":"long"},{"name":"arena","type":"string"},{"name":"status","type":"int"},{"name":"message","type":"string"}"#
     ),
+    Kind::Unpublish => schema_json!(
+      "Unpublish",
+      r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"},{"name":"channel","type":"string"}"#
+    ),
     Kind::ListChannels => schema_json!(
       "ListChannels",
       r#"{"name":"correlation_id","type":"long"},{"name":"client_id","type":"long"}"#
@@ -370,12 +396,13 @@ fn legacy_schemas() -> &'static [(Kind, &'static str)] {
   ]
 }
 
-const ALL_KINDS: [Kind; 16] = [
+const ALL_KINDS: [Kind; 17] = [
   Kind::Register,
   Kind::RegisterReply,
   Kind::Unregister,
   Kind::PublishChannel,
   Kind::PublishReply,
+  Kind::Unpublish,
   Kind::ListChannels,
   Kind::ChannelList,
   Kind::Subscribe,
@@ -575,6 +602,22 @@ mod tests {
     let back: Register = from_frame_compat(&frame).unwrap();
     assert_eq!(back.app_name, "old-svc");
     assert_eq!(back.pid, 0);
+  }
+
+  // A release names its channel, not its id: the id is the broker's and is
+  // reassigned on every restart, while the name is the publisher's own.
+  #[test]
+  fn unpublish_frame_roundtrip() {
+    let msg = Unpublish {
+      correlation_id: 0,
+      client_id: 3,
+      channel: "impulse-ring-http/v1/stream/svc/00000000000000ff/body".into(),
+    };
+    let frame = to_frame(Kind::Unpublish, &msg).unwrap();
+    assert_eq!(catalog().kind_of(frame.schema_fp), Some(Kind::Unpublish));
+    let back: Unpublish = from_frame(Kind::Unpublish, &frame).unwrap();
+    assert_eq!(back.client_id, 3);
+    assert!(back.channel.ends_with("/body"));
   }
 
   #[test]
