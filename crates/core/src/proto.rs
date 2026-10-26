@@ -541,6 +541,64 @@ mod tests {
     }
   }
 
+  /// Кадр `PublishChannel` от связника до `arena_cap` — ровно то, что шлёт
+  /// служба, собранная против прошлой версии шины.
+  ///
+  /// Строгое чтение такой кадр не читает: тело на одно поле короче, и Avro
+  /// упирается в конец буфера — `Failed to read bytes for decoding variable
+  /// length integer`. Брокер на этом возвращает `Err`, то есть **не отвечает
+  /// вовсе**, и связник отваливается по сроку с `timed out waiting for broker
+  /// reply`.
+  #[test]
+  fn a_v1_publish_channel_needs_the_compat_reader() {
+    // Тело, закодированное схемой v1 (пять полей, без `arena_cap`).
+    let v1 = legacy_schemas()
+      .iter()
+      .find(|(k, _)| *k == Kind::PublishChannel)
+      .map(|(_, json)| *json)
+      .expect("схема PublishChannel v1 объявлена");
+    let (schema, fp) = avro::parse(v1).unwrap();
+    #[derive(serde::Serialize)]
+    struct PublishChannelV1 {
+      correlation_id: i64,
+      client_id: i64,
+      channel: String,
+      schema_json: String,
+      access_key: String,
+    }
+    let body = avro::encode(
+      &schema,
+      &PublishChannelV1 {
+        correlation_id: 7,
+        client_id: 3,
+        channel: "app:1:up".into(),
+        schema_json: "{}".into(),
+        access_key: String::new(),
+      },
+    )
+    .unwrap();
+    let frame = Frame::new(fp, body);
+
+    // Отпечаток опознаётся — значит кадр доходит до обработчика, а не
+    // отбраковывается как чужой.
+    assert_eq!(catalog().kind_of(frame.schema_fp), Some(Kind::PublishChannel));
+
+    // Строгое чтение — то, которым читает `on_publish`.
+    let strict = from_frame::<PublishChannel>(Kind::PublishChannel, &frame);
+    let why = strict.unwrap_err().to_string();
+    // Сообщение сверяется дословно: именно его видно в логе брокера
+    // (`control message error: …`), и по нему эту поломку и узнают.
+    assert!(
+      why.contains("Failed to read bytes for decoding variable length integer"),
+      "ожидали отказ варинт-декодера, получили: {why}"
+    );
+
+    // Совместимое — то, которым читают `on_register` и `on_expose`.
+    let compat: PublishChannel = from_frame_compat(&frame).expect("совместимое чтение обязано читать v1");
+    assert_eq!(compat.channel, "app:1:up");
+    assert_eq!(compat.arena_cap, 0, "отсутствующая ёмкость арены — это «по умолчанию»");
+  }
+
   #[test]
   fn register_frame_roundtrip() {
     let msg = Register {

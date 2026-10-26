@@ -300,7 +300,22 @@ impl Broker {
   }
 
   fn on_publish(&mut self, frame: &Frame) -> io::Result<()> {
-    let m: proto::PublishChannel = proto::from_frame(Kind::PublishChannel, frame)?;
+    // `from_frame_compat`, как у `Register` и `ExposeFunction`: схема
+    // `PublishChannel` тоже менялась — в неё добавился `arena_cap`, — и
+    // схема v1 для неё объявлена в `legacy_schemas` ровно затем, чтобы кадр
+    // от связника постарше читался своей схемой, а добавленное поле брало
+    // значение по умолчанию.
+    //
+    // Строгое чтение такой кадр не читает: тело на одно поле короче, и Avro
+    // упирается в конец буфера. А отказ здесь — это `Err` из `handle`, то
+    // есть **ответа не будет вовсе**: связник отваливается по сроку с
+    // `timed out waiting for broker reply`, из которого не следует ничего.
+    //
+    // Канал публикуется на каждое рукопожатие вебсокета (по одному с каждой
+    // стороны), на каждый SSE и на каждое крупное тело, а встроенный RPC — не
+    // публикует. Поэтому одна эта строка выглядела как «HTTP работает, а
+    // сокеты не поднимаются вообще».
+    let m: proto::PublishChannel = proto::from_frame_compat(frame)?;
     if self.reg.channel_name_taken(&m.channel) {
       if let Some(arena) = self.reg.reap_if_released(&m.channel) {
         // The name was sitting out its release grace. Its publisher is gone, so
